@@ -5,6 +5,7 @@ CREATE TABLE jobs (
     status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
     status_message TEXT,
     entrypoint VARCHAR(255) NOT NULL,
+    entrypoint_content TEXT NOT NULL,
     requirements TEXT,
     python_version VARCHAR(10) NOT NULL DEFAULT '3.11',
     gpu_type VARCHAR(20) NOT NULL,
@@ -17,6 +18,7 @@ CREATE TABLE jobs (
     completed_at TIMESTAMPTZ
 );
 -- +goose StatementEnd
+
 
 -- +goose Down
 -- +goose StatementBegin

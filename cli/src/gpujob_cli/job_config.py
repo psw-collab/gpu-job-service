@@ -49,6 +49,7 @@ class JobConfig:
         """Build the JSON body expected by POST /v1/jobs."""
         payload = {
             "entrypoint": self.entrypoint_path.name,
+            "entrypoint_content": self.entrypoint_path.read_text(),
             "python_version": self.python_version,
             "gpu_type": self.gpu_type,
             "gpu_count": self.gpu_count,

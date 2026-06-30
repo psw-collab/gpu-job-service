@@ -11,6 +11,7 @@ class DBJob(Base):
     status = Column(String(20), nullable=False, default="PENDING")
     status_message = Column(Text, nullable=True)
     entrypoint = Column(String(255), nullable=False)
+    entrypoint_content = Column(Text, nullable=False)
     requirements = Column(Text, nullable=True)
     python_version = Column(String(10), nullable=False, default="3.11")
     gpu_type = Column(String(20), nullable=False)
