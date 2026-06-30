@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  platform-db:
+    image: postgres:latest
+    container_name: platform-db
+    environment:
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
