@@ -9,10 +9,11 @@ Expected job.yaml shape:
     gpu_type: A100
     gpu_count: 2
 
-`entrypoint` and `requirements` are paths to local files. The CLI reads
-their contents and sends the raw text to the API, since the server's
-JobSubmitRequest schema expects entrypoint/requirements as strings
-(file contents), not paths.
+`entrypoint` is a path to the user's Python script. The CLI sends the
+filename (e.g. "train.py") to the API, not the file contents.
+
+`requirements` is a path to a requirements.txt file. The CLI reads its
+contents and sends the raw text to the API.
 
 `requirements` is optional -- a job with no dependencies beyond the base
 image is valid.
@@ -47,7 +48,7 @@ class JobConfig:
     def to_request_payload(self) -> dict:
         """Build the JSON body expected by POST /v1/jobs."""
         payload = {
-            "entrypoint": self.entrypoint_path.read_text(),
+            "entrypoint": self.entrypoint_path.name,
             "python_version": self.python_version,
             "gpu_type": self.gpu_type,
             "gpu_count": self.gpu_count,
