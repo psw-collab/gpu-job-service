@@ -17,8 +17,16 @@ from schemas import (
     JobStatusResponse,
 )
 
-config.load_kube_config()
-NAMESPACE = "tsonar-space"
+import os
+
+try:
+    config.load_incluster_config()
+except config.ConfigException:
+    config.load_kube_config()
+
+NAMESPACE = os.getenv("K8S_NAMESPACE")
+if not NAMESPACE:
+    raise RuntimeError("K8S_NAMESPACE environment variable is required")
 core = client.CoreV1Api()
 batch = client.BatchV1Api()
 
@@ -129,8 +137,13 @@ def get_job_status(job_id: str, db: Session = Depends(get_db)):
     )
 
 
-def k8s_status(job_id: str) -> str:
-    s = batch.read_namespaced_job_status(job_id, NAMESPACE).status
+def k8s_status(job_id: str) -> str | None:
+    try:
+        s = batch.read_namespaced_job_status(job_id, NAMESPACE).status
+    except client.ApiException as e:
+        if e.status == 404:
+            return None
+        raise
     if s.succeeded:
         return "SUCCEEDED"
     if s.failed:
@@ -148,6 +161,8 @@ async def reconcile_loop():
             for job in jobs:
                 try:
                     new_status = k8s_status(job.id)
+                    if new_status is None:
+                        continue
                     if new_status != job.status:
                         job.status = new_status
                         now = datetime.now(timezone.utc)
@@ -172,4 +187,3 @@ async def reconcile_loop():
 @app.on_event("startup")
 async def start_reconciler():
     asyncio.create_task(reconcile_loop())
-
