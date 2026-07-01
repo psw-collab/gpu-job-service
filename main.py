@@ -18,7 +18,7 @@ from schemas import (
 )
 
 config.load_kube_config()
-NAMESPACE = "sdara-space"
+NAMESPACE = "tsonar-space"
 core = client.CoreV1Api()
 batch = client.BatchV1Api()
 
@@ -172,3 +172,4 @@ async def reconcile_loop():
 @app.on_event("startup")
 async def start_reconciler():
     asyncio.create_task(reconcile_loop())
+
