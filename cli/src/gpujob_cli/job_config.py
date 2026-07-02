@@ -39,8 +39,9 @@ class JobConfigError(Exception):
 
 @dataclass
 class JobConfig:
-    entrypoint_path: Path
-    requirements_path: Optional[Path]
+    entrypoint_name: str
+    entrypoint_content: str
+    requirements_content: Optional[str]
     python_version: str
     gpu_type: str
     gpu_count: int
@@ -48,14 +49,36 @@ class JobConfig:
     def to_request_payload(self) -> dict:
         """Build the JSON body expected by POST /v1/jobs."""
         payload = {
-            "entrypoint": self.entrypoint_path.name,
+            "entrypoint": self.entrypoint_name,
+            "entrypoint_content": self.entrypoint_content,
             "python_version": self.python_version,
             "gpu_type": self.gpu_type,
             "gpu_count": self.gpu_count,
         }
-        if self.requirements_path is not None:
-            payload["requirements"] = self.requirements_path.read_text()
+        if self.requirements_content is not None:
+            payload["requirements"] = self.requirements_content
         return payload
+
+
+def _read_text_file(path: Path, yaml_path: Path, label: str) -> str:
+    """
+    Read a referenced file as UTF-8, turning encoding/OS errors into a clear
+    JobConfigError instead of an unhandled traceback. utf-8-sig transparently
+    strips a UTF-8 BOM; a UTF-16 file (e.g. produced by PowerShell's `>`) will
+    fail with an actionable message.
+    """
+    try:
+        return path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise JobConfigError(
+            f"{yaml_path}: {label} file '{path.name}' is not valid UTF-8. "
+            f"Re-save it as UTF-8 (in PowerShell: "
+            f"Get-Content '{path.name}' | Out-File -Encoding utf8 '{path.name}')."
+        ) from e
+    except OSError as e:
+        raise JobConfigError(
+            f"{yaml_path}: could not read {label} file '{path}': {e}"
+        ) from e
 
 
 def _require_str(data: dict, field: str, yaml_path: Path) -> str:
@@ -154,9 +177,17 @@ def load_job_config(yaml_path: Path) -> JobConfig:
             f"{MAX_GPU_COUNT}, got {gpu_count}"
         )
 
+    entrypoint_content = _read_text_file(entrypoint_path, yaml_path, "entrypoint")
+    requirements_content = None
+    if requirements_path is not None:
+        requirements_content = _read_text_file(
+            requirements_path, yaml_path, "requirements"
+        )
+
     return JobConfig(
-        entrypoint_path=entrypoint_path,
-        requirements_path=requirements_path,
+        entrypoint_name=entrypoint_path.name,
+        entrypoint_content=entrypoint_content,
+        requirements_content=requirements_content,
         python_version=python_version,
         gpu_type=gpu_type,
         gpu_count=gpu_count,
