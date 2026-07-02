@@ -3,8 +3,13 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
+ALLOWED_GPU_TYPES = {"A100", "H100"}
+ALLOWED_PYTHON_VERSIONS = {"3.11", "3.12", "3.13"}
+
+
 class JobSubmitRequest(BaseModel):
     entrypoint: str
+    entrypoint_content: str
     requirements: Optional[str] = None
     python_version: str = "3.11"
     gpu_type: str = "A100"
