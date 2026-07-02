@@ -2,9 +2,12 @@ import asyncio
 import hashlib
 import secrets
 from datetime import datetime, timezone
+import os
+NAMESPACE = os.getenv("K8S_NAMESPACE", "tsonar-space")
 
 from fastapi import FastAPI, Depends, HTTPException
 from kubernetes import client, config
+from kubernetes.client.exceptions import ApiException
 from sqlalchemy.orm import Session
 
 from database import get_db, SessionLocal
@@ -18,7 +21,6 @@ from schemas import (
 )
 
 config.load_kube_config()
-NAMESPACE = "tsonar-space"
 core = client.CoreV1Api()
 batch = client.BatchV1Api()
 
@@ -34,10 +36,12 @@ def generate_job_id(db: Session) -> str:
 
 
 def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requirements: str, python_version: str):
+    """Create a ConfigMap + batch Job in K8s.  Cleans up the ConfigMap if the Job creation fails."""
+    cm_name = f"{job_id}-files"
     core.create_namespaced_config_map(
         NAMESPACE,
         client.V1ConfigMap(
-            metadata=client.V1ObjectMeta(name=f"{job_id}-files"),
+            metadata=client.V1ObjectMeta(name=cm_name),
             data={entrypoint: entrypoint_content, "requirements.txt": requirements or ""},
         ),
     )
@@ -53,32 +57,33 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
         containers=[container],
         volumes=[client.V1Volume(
             name="code",
-            config_map=client.V1ConfigMapVolumeSource(name=f"{job_id}-files"))],
+            config_map=client.V1ConfigMapVolumeSource(name=cm_name))],
     )
-    batch.create_namespaced_job(
-        NAMESPACE,
-        client.V1Job(
-            metadata=client.V1ObjectMeta(name=job_id),
-            spec=client.V1JobSpec(
-                template=client.V1PodTemplateSpec(spec=pod_spec),
-                backoff_limit=0,
-                ttl_seconds_after_finished=300),
-        ),
-    )
-
+    try:
+        batch.create_namespaced_job(
+            NAMESPACE,
+            client.V1Job(
+                metadata=client.V1ObjectMeta(name=job_id),
+                spec=client.V1JobSpec(
+                    template=client.V1PodTemplateSpec(spec=pod_spec),
+                    backoff_limit=0,
+                    ttl_seconds_after_finished=300),
+            ),
+        )
+    except Exception:
+        # Clean up the orphaned ConfigMap so we don't leak K8s resources
+        try:
+            core.delete_namespaced_config_map(cm_name, NAMESPACE)
+        except Exception:
+            pass  # best-effort cleanup
+        raise
 
 @app.post("/v1/jobs", response_model=JobSubmitResponse)
 def submit_job(request: JobSubmitRequest, db: Session = Depends(get_db)):
     if request.gpu_type not in ALLOWED_GPU_TYPES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Unsupported gpu_type '{request.gpu_type}'. Allowed: {', '.join(sorted(ALLOWED_GPU_TYPES))}",
-        )
+        raise HTTPException(422, f"Unsupported gpu_type '{request.gpu_type}'. Allowed: {', '.join(sorted(ALLOWED_GPU_TYPES))}")
     if request.python_version not in ALLOWED_PYTHON_VERSIONS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Unsupported python_version '{request.python_version}'. Allowed: {', '.join(sorted(ALLOWED_PYTHON_VERSIONS))}",
-        )
+        raise HTTPException(422, f"Unsupported python_version '{request.python_version}'. Allowed: {', '.join(sorted(ALLOWED_PYTHON_VERSIONS))}")
 
     job_id = generate_job_id(db)
 
@@ -102,11 +107,19 @@ def submit_job(request: JobSubmitRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_job)
 
-    create_k8s_job(job_id, request.entrypoint, request.entrypoint_content,
-                   request.requirements, request.python_version)
+    try:
+        create_k8s_job(job_id, request.entrypoint, request.entrypoint_content,
+                       request.requirements, request.python_version)
+    except Exception as e:
+        new_job.status = "FAILED"
+        new_job.failure_reason = "platform_error: failed to schedule job on cluster"
+        new_job.status_message = "We could not start your job due to a platform error. Please try again."
+        new_job.completed_at = datetime.now(timezone.utc)
+        db.commit()
+        print(f"create_k8s_job failed for {job_id}: {e}")
+        return JobSubmitResponse(job_id=new_job.id, status=new_job.status)
 
     return JobSubmitResponse(job_id=new_job.id, status=new_job.status)
-
 
 @app.get("/v1/jobs/{job_id}", response_model=JobStatusResponse)
 def get_job_status(job_id: str, db: Session = Depends(get_db)):
@@ -161,6 +174,21 @@ async def reconcile_loop():
                             job.completed_at = now
                             job.status_message = "Job failed"
                     db.commit()
+                except ApiException as e:
+                    if e.status == 404:
+                        # Ghost job: DB row exists but K8s Job doesn't → retire it
+                        job.status = "FAILED"
+                        job.failure_reason = "ghost: no matching K8s Job found"
+                        job.status_message = (
+                            "This job has no matching workload on the cluster. "
+                            "It was likely lost due to a scheduling failure."
+                        )
+                        job.completed_at = datetime.now(timezone.utc)
+                        db.commit()
+                        print(f"[ghost-fix] retired ghost job {job.id}")
+                    else:
+                        print(f"reconcile K8s error for {job.id}: {e}")
+                        db.rollback()
                 except Exception as e:
                     print(f"reconcile error for {job.id}: {e}")
                     db.rollback()
