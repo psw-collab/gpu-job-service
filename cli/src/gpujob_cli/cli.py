@@ -6,10 +6,13 @@ Usage:
     gpujob status job-a1b2c3d4
 """
 
+import json
 from pathlib import Path
+from typing import Optional
 
 import typer
 from rich.console import Console
+from rich.table import Table
 
 from . import api_client
 from .config import get_api_url
@@ -23,6 +26,16 @@ app = typer.Typer(
 
 console = Console()
 err_console = Console(stderr=True)
+
+# Shared across `status` and `list` so colours stay consistent.
+STATUS_COLORS = {
+    "PENDING": "yellow",
+    "SCHEDULED": "yellow",
+    "RUNNING": "cyan",
+    "SUCCEEDED": "green",
+    "FAILED": "red",
+    "CANCELLED": "magenta",
+}
 
 
 @app.command()
@@ -80,17 +93,83 @@ def status(
     _print_status(result)
 
 
+@app.command(name="list")
+def list_command(
+    status: Optional[str] = typer.Option(
+        None, "--status", help="Only show jobs in this status (e.g. RUNNING)."
+    ),
+    output: str = typer.Option(
+        "table", "--output", "-o", help="Output format: 'table' or 'json'."
+    ),
+):
+    """List submitted jobs and their current status."""
+    if output not in ("table", "json"):
+        err_console.print(
+            f"[bold red]Error:[/bold red] unknown --output '{output}'. "
+            f"Use 'table' or 'json'."
+        )
+        raise typer.Exit(code=2)
+
+    base_url = get_api_url()
+    try:
+        result = api_client.list_jobs(base_url, status=status)
+    except api_client.ApiError as e:
+        err_console.print(f"[bold red]Error:[/bold red] {e}")
+        raise typer.Exit(code=1)
+
+    jobs = result.get("jobs", [])
+
+    if output == "json":
+        # Clean, unstyled JSON for scripts/piping.
+        typer.echo(json.dumps(result, indent=2, default=str))
+        return
+
+    if not jobs:
+        console.print("No jobs found.")
+        return
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("JOB ID")
+    table.add_column("STATUS")
+    table.add_column("GPU")
+    table.add_column("SUBMITTED")
+    for job in jobs:
+        status_value = job.get("status", "UNKNOWN")
+        color = STATUS_COLORS.get(status_value, "white")
+        gpu = f"{job.get('gpu_type', '-')} x{job.get('gpu_count', '-')}"
+        table.add_row(
+            job.get("id", "-"),
+            f"[{color}]{status_value}[/{color}]",
+            gpu,
+            str(job.get("submitted_at", "-")),
+        )
+    console.print(table)
+
+
+@app.command()
+def cancel(
+    job_id: str = typer.Argument(..., help="The job ID to cancel."),
+):
+    """Cancel a submitted job that hasn't finished yet."""
+    base_url = get_api_url()
+    try:
+        result = api_client.cancel_job(base_url, job_id)
+    except api_client.ApiError as e:
+        err_console.print(f"[bold red]Error:[/bold red] {e}")
+        raise typer.Exit(code=1)
+
+    new_status = result.get("status", "CANCELLED")
+    color = STATUS_COLORS.get(new_status, "magenta")
+    console.print(
+        f"Job [bold]{result.get('id', job_id)}[/bold] is now "
+        f"[{color}]{new_status}[/{color}]."
+    )
+
+
 def _print_status(result: dict) -> None:
     """Pretty-print a JobStatusResponse dict."""
     status_value = result.get("status", "UNKNOWN")
-    status_colors = {
-        "PENDING": "yellow",
-        "SCHEDULED": "yellow",
-        "RUNNING": "cyan",
-        "SUCCEEDED": "green",
-        "FAILED": "red",
-    }
-    color = status_colors.get(status_value, "white")
+    color = STATUS_COLORS.get(status_value, "white")
 
     console.print(f"Job ID:       {result.get('id', '-')}")
     console.print(f"Status:       [bold {color}]{status_value}[/bold {color}]")

@@ -69,3 +69,46 @@ def get_job_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
     return JobStatusResponse(**job)
+
+# ---------------------------------------------------------------------------
+# PROPOSED contract additions (list / cancel). Mirrors what Person 2's real
+# API needs to implement. `CANCELLED` is a new status value for the contract.
+# ---------------------------------------------------------------------------
+
+TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "CANCELLED"}
+
+
+class JobSummary(BaseModel):
+    id: str
+    status: str
+    gpu_type: str
+    gpu_count: int
+    submitted_at: datetime
+
+
+class JobListResponse(BaseModel):
+    jobs: list[JobSummary]
+
+
+@app.get("/v1/jobs", response_model=JobListResponse)
+def list_jobs(status: Optional[str] = None):
+    jobs = list(_jobs.values())
+    if status:
+        jobs = [j for j in jobs if j["status"] == status]
+    return JobListResponse(jobs=[JobSummary(**j) for j in jobs])
+
+
+@app.post("/v1/jobs/{job_id}/cancel", response_model=JobStatusResponse)
+def cancel_job(job_id: str):
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    if job["status"] in TERMINAL_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot cancel a job that is already {job['status']}",
+        )
+    job["status"] = "CANCELLED"
+    job["status_message"] = "Job cancelled by user"
+    job["completed_at"] = datetime.now(timezone.utc)
+    return JobStatusResponse(**job)
