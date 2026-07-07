@@ -4,6 +4,7 @@ import secrets
 from datetime import datetime, timezone
 import os
 NAMESPACE = os.getenv("K8S_NAMESPACE", "tsonar-space")
+SCHEDULING_TIMEOUT_MINUTES = int(os.getenv("SCHEDULING_TIMEOUT_MINUTES", "30"))
 
 from fastapi import FastAPI, Depends, HTTPException
 from kubernetes import client, config
@@ -36,15 +37,10 @@ def generate_job_id(db: Session) -> str:
 
 
 def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requirements: str, python_version: str):
-    """Create a ConfigMap + batch Job in K8s.  Cleans up the ConfigMap if the Job creation fails."""
+    """Create a batch Job first, then a ConfigMap owned by that Job.
+    Kubernetes auto-deletes the ConfigMap whenever the Job is deleted (TTL or manual)."""
     cm_name = f"{job_id}-files"
-    core.create_namespaced_config_map(
-        NAMESPACE,
-        client.V1ConfigMap(
-            metadata=client.V1ObjectMeta(name=cm_name),
-            data={entrypoint: entrypoint_content, "requirements.txt": requirements or ""},
-        ),
-    )
+
     container = client.V1Container(
         name="runner",
         image=f"python:{python_version}-slim",
@@ -59,23 +55,43 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
             name="code",
             config_map=client.V1ConfigMapVolumeSource(name=cm_name))],
     )
+
+    # 1. Create the Job first so we get back its UID for the owner reference
+    created_job = batch.create_namespaced_job(
+        NAMESPACE,
+        client.V1Job(
+            metadata=client.V1ObjectMeta(name=job_id),
+            spec=client.V1JobSpec(
+                template=client.V1PodTemplateSpec(spec=pod_spec),
+                backoff_limit=0,
+                ttl_seconds_after_finished=300),
+        ),
+    )
+
+    # 2. Create the ConfigMap owned by the Job — auto-deleted when the Job is deleted
+    owner_ref = client.V1OwnerReference(
+        api_version="batch/v1",
+        kind="Job",
+        name=created_job.metadata.name,
+        uid=created_job.metadata.uid,
+        block_owner_deletion=True,
+        controller=True,
+    )
     try:
-        batch.create_namespaced_job(
+        core.create_namespaced_config_map(
             NAMESPACE,
-            client.V1Job(
-                metadata=client.V1ObjectMeta(name=job_id),
-                spec=client.V1JobSpec(
-                    template=client.V1PodTemplateSpec(spec=pod_spec),
-                    backoff_limit=0,
-                    ttl_seconds_after_finished=300),
+            client.V1ConfigMap(
+                metadata=client.V1ObjectMeta(name=cm_name, owner_references=[owner_ref]),
+                data={entrypoint: entrypoint_content, "requirements.txt": requirements or ""},
             ),
         )
     except Exception:
-        # Clean up the orphaned ConfigMap so we don't leak K8s resources
+        # ConfigMap failed after the Job was created — clean up the Job so we
+        # don't leave a Job with no script mounted (it would just error in the pod)
         try:
-            core.delete_namespaced_config_map(cm_name, NAMESPACE)
+            batch.delete_namespaced_job(job_id, NAMESPACE, propagation_policy="Foreground")
         except Exception:
-            pass  # best-effort cleanup
+            pass
         raise
 
 @app.post("/v1/jobs", response_model=JobSubmitResponse)
@@ -155,45 +171,65 @@ def k8s_status(job_id: str) -> str:
 
 async def reconcile_loop():
     while True:
-        db = SessionLocal()
         try:
-            jobs = db.query(DBJob).filter(DBJob.status.notin_(("SUCCEEDED", "FAILED"))).all()
-            for job in jobs:
-                try:
-                    new_status = k8s_status(job.id)
-                    if new_status != job.status:
-                        job.status = new_status
-                        now = datetime.now(timezone.utc)
-                        if new_status == "RUNNING" and job.started_at is None:
-                            job.started_at = now
-                            job.status_message = "Job is running"
-                        if new_status == "SUCCEEDED":
-                            job.completed_at = now
-                            job.status_message = "Job completed successfully"
-                        if new_status == "FAILED":
-                            job.completed_at = now
-                            job.status_message = "Job failed"
-                    db.commit()
-                except ApiException as e:
-                    if e.status == 404:
-                        # Ghost job: DB row exists but K8s Job doesn't → retire it
-                        job.status = "FAILED"
-                        job.failure_reason = "ghost: no matching K8s Job found"
-                        job.status_message = (
-                            "This job has no matching workload on the cluster. "
-                            "It was likely lost due to a scheduling failure."
-                        )
-                        job.completed_at = datetime.now(timezone.utc)
+            db = SessionLocal()
+            try:
+                jobs = db.query(DBJob).filter(DBJob.status.notin_(("SUCCEEDED", "FAILED"))).all()
+                for job in jobs:
+                    try:
+                        # --- FIX #4: timeout check goes here, before status lookup ---
+                        age_seconds = (datetime.now(timezone.utc) - job.submitted_at).total_seconds()
+                        if age_seconds > SCHEDULING_TIMEOUT_MINUTES * 60:
+                            job.status = "FAILED"
+                            job.failure_reason = "scheduling_timeout"
+                            job.status_message = (
+                                f"No GPUs of the requested type were available within the "
+                                f"{SCHEDULING_TIMEOUT_MINUTES}-minute timeout window. "
+                                f"Please try again or contact support."
+                            )
+                            job.completed_at = datetime.now(timezone.utc)
+                            db.commit()
+                            print(f"[timeout] job {job.id} exceeded {SCHEDULING_TIMEOUT_MINUTES}min, marked FAILED")
+                            continue
+
+                        new_status = k8s_status(job.id)
+                        if new_status != job.status:
+                            job.status = new_status
+                            now = datetime.now(timezone.utc)
+                            if new_status == "RUNNING" and job.started_at is None:
+                                job.started_at = now
+                                job.status_message = "Job is running"
+                            if new_status == "SUCCEEDED":
+                                job.completed_at = now
+                                job.status_message = "Job completed successfully"
+                            if new_status == "FAILED":
+                                job.completed_at = now
+                                job.status_message = "Job failed"
                         db.commit()
-                        print(f"[ghost-fix] retired ghost job {job.id}")
-                    else:
-                        print(f"reconcile K8s error for {job.id}: {e}")
+                    except ApiException as e:
+                        if e.status == 404:
+                            job.status = "FAILED"
+                            job.failure_reason = "ghost: no matching K8s Job found"
+                            job.status_message = (
+                                "This job has no matching workload on the cluster. "
+                                "It was likely lost due to a scheduling failure."
+                            )
+                            job.completed_at = datetime.now(timezone.utc)
+                            db.commit()
+                            print(f"[ghost-fix] retired ghost job {job.id}")
+                        else:
+                            print(f"reconcile K8s error for {job.id}: {e}")
+                            db.rollback()
+                    except Exception as e:
+                        print(f"reconcile error for {job.id}: {e}")
                         db.rollback()
-                except Exception as e:
-                    print(f"reconcile error for {job.id}: {e}")
-                    db.rollback()
-        finally:
-            db.close()
+            finally:
+                db.close()
+        except Exception as e:
+            # Catches DB connection failures, query errors — anything at the outer level.
+            # Without this, an exception here would kill the whole coroutine permanently.
+            print(f"reconcile_loop outer error (will retry in 5s): {e}")
+
         await asyncio.sleep(5)
 
 
