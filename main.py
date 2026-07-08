@@ -2,9 +2,13 @@ import asyncio
 import hashlib
 import secrets
 from datetime import datetime, timezone
+import os
+NAMESPACE = os.getenv("K8S_NAMESPACE", "tsonar-space")
+SCHEDULING_TIMEOUT_MINUTES = int(os.getenv("SCHEDULING_TIMEOUT_MINUTES", "30"))
 
 from fastapi import FastAPI, Depends, HTTPException
 from kubernetes import client, config
+from kubernetes.client.exceptions import ApiException
 from sqlalchemy.orm import Session
 
 from database import get_db, SessionLocal
@@ -42,13 +46,10 @@ def generate_job_id(db: Session) -> str:
 
 
 def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requirements: str, python_version: str):
-    core.create_namespaced_config_map(
-        NAMESPACE,
-        client.V1ConfigMap(
-            metadata=client.V1ObjectMeta(name=f"{job_id}-files"),
-            data={entrypoint: entrypoint_content, "requirements.txt": requirements or ""},
-        ),
-    )
+    """Create a batch Job first, then a ConfigMap owned by that Job.
+    Kubernetes auto-deletes the ConfigMap whenever the Job is deleted (TTL or manual)."""
+    cm_name = f"{job_id}-files"
+
     container = client.V1Container(
         name="runner",
         image=f"python:{python_version}-slim",
@@ -61,9 +62,11 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
         containers=[container],
         volumes=[client.V1Volume(
             name="code",
-            config_map=client.V1ConfigMapVolumeSource(name=f"{job_id}-files"))],
+            config_map=client.V1ConfigMapVolumeSource(name=cm_name))],
     )
-    batch.create_namespaced_job(
+
+    # 1. Create the Job first so we get back its UID for the owner reference
+    created_job = batch.create_namespaced_job(
         NAMESPACE,
         client.V1Job(
             metadata=client.V1ObjectMeta(name=job_id),
@@ -74,19 +77,38 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
         ),
     )
 
+    # 2. Create the ConfigMap owned by the Job — auto-deleted when the Job is deleted
+    owner_ref = client.V1OwnerReference(
+        api_version="batch/v1",
+        kind="Job",
+        name=created_job.metadata.name,
+        uid=created_job.metadata.uid,
+        block_owner_deletion=True,
+        controller=True,
+    )
+    try:
+        core.create_namespaced_config_map(
+            NAMESPACE,
+            client.V1ConfigMap(
+                metadata=client.V1ObjectMeta(name=cm_name, owner_references=[owner_ref]),
+                data={entrypoint: entrypoint_content, "requirements.txt": requirements or ""},
+            ),
+        )
+    except Exception:
+        # ConfigMap failed after the Job was created — clean up the Job so we
+        # don't leave a Job with no script mounted (it would just error in the pod)
+        try:
+            batch.delete_namespaced_job(job_id, NAMESPACE, propagation_policy="Foreground")
+        except Exception:
+            pass
+        raise
 
 @app.post("/v1/jobs", response_model=JobSubmitResponse)
 def submit_job(request: JobSubmitRequest, db: Session = Depends(get_db)):
     if request.gpu_type not in ALLOWED_GPU_TYPES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Unsupported gpu_type '{request.gpu_type}'. Allowed: {', '.join(sorted(ALLOWED_GPU_TYPES))}",
-        )
+        raise HTTPException(422, f"Unsupported gpu_type '{request.gpu_type}'. Allowed: {', '.join(sorted(ALLOWED_GPU_TYPES))}")
     if request.python_version not in ALLOWED_PYTHON_VERSIONS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Unsupported python_version '{request.python_version}'. Allowed: {', '.join(sorted(ALLOWED_PYTHON_VERSIONS))}",
-        )
+        raise HTTPException(422, f"Unsupported python_version '{request.python_version}'. Allowed: {', '.join(sorted(ALLOWED_PYTHON_VERSIONS))}")
 
     job_id = generate_job_id(db)
 
@@ -110,11 +132,19 @@ def submit_job(request: JobSubmitRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_job)
 
-    create_k8s_job(job_id, request.entrypoint, request.entrypoint_content,
-                   request.requirements, request.python_version)
+    try:
+        create_k8s_job(job_id, request.entrypoint, request.entrypoint_content,
+                       request.requirements, request.python_version)
+    except Exception as e:
+        new_job.status = "FAILED"
+        new_job.failure_reason = "platform_error: failed to schedule job on cluster"
+        new_job.status_message = "We could not start your job due to a platform error. Please try again."
+        new_job.completed_at = datetime.now(timezone.utc)
+        db.commit()
+        print(f"create_k8s_job failed for {job_id}: {e}")
+        return JobSubmitResponse(job_id=new_job.id, status=new_job.status)
 
     return JobSubmitResponse(job_id=new_job.id, status=new_job.status)
-
 
 @app.get("/v1/jobs/{job_id}", response_model=JobStatusResponse)
 def get_job_status(job_id: str, db: Session = Depends(get_db)):
