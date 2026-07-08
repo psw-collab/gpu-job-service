@@ -21,7 +21,16 @@ from schemas import (
     JobStatusResponse,
 )
 
-config.load_kube_config()
+import os
+
+try:
+    config.load_incluster_config()
+except config.ConfigException:
+    config.load_kube_config()
+
+NAMESPACE = os.getenv("K8S_NAMESPACE")
+if not NAMESPACE:
+    raise RuntimeError("K8S_NAMESPACE environment variable is required")
 core = client.CoreV1Api()
 batch = client.BatchV1Api()
 
@@ -158,8 +167,13 @@ def get_job_status(job_id: str, db: Session = Depends(get_db)):
     )
 
 
-def k8s_status(job_id: str) -> str:
-    s = batch.read_namespaced_job_status(job_id, NAMESPACE).status
+def k8s_status(job_id: str) -> str | None:
+    try:
+        s = batch.read_namespaced_job_status(job_id, NAMESPACE).status
+    except client.ApiException as e:
+        if e.status == 404:
+            return None
+        raise
     if s.succeeded:
         return "SUCCEEDED"
     if s.failed:
@@ -169,6 +183,37 @@ def k8s_status(job_id: str) -> str:
     return "PENDING"
 
 
+FAILURE_REASON_OOM = "Your job ran out of memory. Try requesting more memory or reducing batch size."
+FAILURE_REASON_NODE = "A hardware issue interrupted your job. This is not a problem with your code, please resubmit."
+FAILURE_REASON_USER_CODE = "Your job exited with an error. Check the logs for the full traceback."
+FAILURE_REASON_UNKNOWN = "Your job failed for an unknown reason. Contact support with your job ID."
+
+
+def classify_pod_failure(job_id: str) -> str:
+    try:
+        pods = core.list_namespaced_pod(NAMESPACE, label_selector=f"job-name={job_id}").items
+    except client.ApiException:
+        return FAILURE_REASON_UNKNOWN
+
+    if not pods:
+        return FAILURE_REASON_UNKNOWN
+
+    pod = pods[0]
+    if pod.status.reason in ("Evicted", "NodeLost", "NodeAffinity"):
+        return FAILURE_REASON_NODE
+
+    for cs in pod.status.container_statuses or []:
+        terminated = cs.state.terminated if cs.state else None
+        if not terminated:
+            continue
+        if terminated.reason == "OOMKilled" or terminated.exit_code == 137:
+            return FAILURE_REASON_OOM
+        if terminated.exit_code:
+            return FAILURE_REASON_USER_CODE
+
+    return FAILURE_REASON_UNKNOWN
+
+
 async def reconcile_loop():
     while True:
         try:
@@ -176,23 +221,11 @@ async def reconcile_loop():
             try:
                 jobs = db.query(DBJob).filter(DBJob.status.notin_(("SUCCEEDED", "FAILED"))).all()
                 for job in jobs:
+                    job_id = job.id
                     try:
-                        # --- FIX #4: timeout check goes here, before status lookup ---
-                        age_seconds = (datetime.now(timezone.utc) - job.submitted_at).total_seconds()
-                        if age_seconds > SCHEDULING_TIMEOUT_MINUTES * 60:
-                            job.status = "FAILED"
-                            job.failure_reason = "scheduling_timeout"
-                            job.status_message = (
-                                f"No GPUs of the requested type were available within the "
-                                f"{SCHEDULING_TIMEOUT_MINUTES}-minute timeout window. "
-                                f"Please try again or contact support."
-                            )
-                            job.completed_at = datetime.now(timezone.utc)
-                            db.commit()
-                            print(f"[timeout] job {job.id} exceeded {SCHEDULING_TIMEOUT_MINUTES}min, marked FAILED")
+                        new_status = k8s_status(job_id)
+                        if new_status is None:
                             continue
-
-                        new_status = k8s_status(job.id)
                         if new_status != job.status:
                             job.status = new_status
                             now = datetime.now(timezone.utc)
@@ -205,35 +238,18 @@ async def reconcile_loop():
                             if new_status == "FAILED":
                                 job.completed_at = now
                                 job.status_message = "Job failed"
+                                job.failure_reason = classify_pod_failure(job_id)
                         db.commit()
-                    except ApiException as e:
-                        if e.status == 404:
-                            job.status = "FAILED"
-                            job.failure_reason = "ghost: no matching K8s Job found"
-                            job.status_message = (
-                                "This job has no matching workload on the cluster. "
-                                "It was likely lost due to a scheduling failure."
-                            )
-                            job.completed_at = datetime.now(timezone.utc)
-                            db.commit()
-                            print(f"[ghost-fix] retired ghost job {job.id}")
-                        else:
-                            print(f"reconcile K8s error for {job.id}: {e}")
-                            db.rollback()
                     except Exception as e:
-                        print(f"reconcile error for {job.id}: {e}")
+                        print(f"reconcile error for {job_id}: {e}")
                         db.rollback()
             finally:
                 db.close()
         except Exception as e:
-            # Catches DB connection failures, query errors — anything at the outer level.
-            # Without this, an exception here would kill the whole coroutine permanently.
-            print(f"reconcile_loop outer error (will retry in 5s): {e}")
-
+            print(f"reconcile loop error: {e}")
         await asyncio.sleep(5)
 
 
 @app.on_event("startup")
 async def start_reconciler():
     asyncio.create_task(reconcile_loop())
-

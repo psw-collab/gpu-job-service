@@ -18,6 +18,7 @@ _jobs: dict = {}
 
 class JobSubmitRequest(BaseModel):
     entrypoint: str
+    entrypoint_content: str
     requirements: Optional[str] = None
     python_version: str = "3.11"
     gpu_type: str = "A100"
