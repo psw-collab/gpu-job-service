@@ -4,6 +4,7 @@ import secrets
 from datetime import datetime, timezone
 import os
 NAMESPACE = os.getenv("K8S_NAMESPACE", "tsonar-space")
+SCHEDULING_TIMEOUT_MINUTES = int(os.getenv("SCHEDULING_TIMEOUT_MINUTES", "30"))
 
 from fastapi import FastAPI, Depends, HTTPException
 from kubernetes import client, config
@@ -45,15 +46,10 @@ def generate_job_id(db: Session) -> str:
 
 
 def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requirements: str, python_version: str):
-    """Create a ConfigMap + batch Job in K8s.  Cleans up the ConfigMap if the Job creation fails."""
+    """Create a batch Job first, then a ConfigMap owned by that Job.
+    Kubernetes auto-deletes the ConfigMap whenever the Job is deleted (TTL or manual)."""
     cm_name = f"{job_id}-files"
-    core.create_namespaced_config_map(
-        NAMESPACE,
-        client.V1ConfigMap(
-            metadata=client.V1ObjectMeta(name=cm_name),
-            data={entrypoint: entrypoint_content, "requirements.txt": requirements or ""},
-        ),
-    )
+
     container = client.V1Container(
         name="runner",
         image=f"python:{python_version}-slim",
@@ -68,23 +64,43 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
             name="code",
             config_map=client.V1ConfigMapVolumeSource(name=cm_name))],
     )
+
+    # 1. Create the Job first so we get back its UID for the owner reference
+    created_job = batch.create_namespaced_job(
+        NAMESPACE,
+        client.V1Job(
+            metadata=client.V1ObjectMeta(name=job_id),
+            spec=client.V1JobSpec(
+                template=client.V1PodTemplateSpec(spec=pod_spec),
+                backoff_limit=0,
+                ttl_seconds_after_finished=300),
+        ),
+    )
+
+    # 2. Create the ConfigMap owned by the Job — auto-deleted when the Job is deleted
+    owner_ref = client.V1OwnerReference(
+        api_version="batch/v1",
+        kind="Job",
+        name=created_job.metadata.name,
+        uid=created_job.metadata.uid,
+        block_owner_deletion=True,
+        controller=True,
+    )
     try:
-        batch.create_namespaced_job(
+        core.create_namespaced_config_map(
             NAMESPACE,
-            client.V1Job(
-                metadata=client.V1ObjectMeta(name=job_id),
-                spec=client.V1JobSpec(
-                    template=client.V1PodTemplateSpec(spec=pod_spec),
-                    backoff_limit=0,
-                    ttl_seconds_after_finished=300),
+            client.V1ConfigMap(
+                metadata=client.V1ObjectMeta(name=cm_name, owner_references=[owner_ref]),
+                data={entrypoint: entrypoint_content, "requirements.txt": requirements or ""},
             ),
         )
     except Exception:
-        # Clean up the orphaned ConfigMap so we don't leak K8s resources
+        # ConfigMap failed after the Job was created — clean up the Job so we
+        # don't leave a Job with no script mounted (it would just error in the pod)
         try:
-            core.delete_namespaced_config_map(cm_name, NAMESPACE)
+            batch.delete_namespaced_job(job_id, NAMESPACE, propagation_policy="Foreground")
         except Exception:
-            pass  # best-effort cleanup
+            pass
         raise
 
 @app.post("/v1/jobs", response_model=JobSubmitResponse)
