@@ -35,11 +35,20 @@ INTERNAL_TOKEN = os.getenv("INTERNAL_TOKEN")
 if not INTERNAL_TOKEN:
     raise RuntimeError("INTERNAL_TOKEN environment variable is required")
 
+API_KEY = os.getenv("API_KEY")
+if not API_KEY:
+    raise RuntimeError("API_KEY environment variable is required")
+
 RETENTION_PERIOD = timedelta(days=int(os.getenv("RETENTION_DAYS", "7")))
 
 
 def require_internal_token(x_internal_token: str = Header(...)):
     if x_internal_token != INTERNAL_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+def require_api_key(x_api_key: str = Header(...)):
+    if x_api_key != API_KEY:
         raise HTTPException(status_code=403, detail="Forbidden")
 
 
@@ -51,7 +60,7 @@ def generate_job_id(db: Session) -> str:
     raise HTTPException(status_code=500, detail="Failed to generate unique job ID")
 
 
-@app.post("/v1/jobs", response_model=JobSubmitResponse)
+@app.post("/v1/jobs", response_model=JobSubmitResponse, dependencies=[Depends(require_api_key)])
 def submit_job(request: JobSubmitRequest, db: Session = Depends(get_db)):
     if request.gpu_type not in ALLOWED_GPU_TYPES:
         raise HTTPException(
@@ -89,7 +98,7 @@ def submit_job(request: JobSubmitRequest, db: Session = Depends(get_db)):
     return JobSubmitResponse(job_id=new_job.id, status=new_job.status)
 
 
-@app.get("/v1/jobs/{job_id}", response_model=JobStatusResponse)
+@app.get("/v1/jobs/{job_id}", response_model=JobStatusResponse, dependencies=[Depends(require_api_key)])
 def get_job_status(job_id: str, db: Session = Depends(get_db)):
     job = db.query(DBJob).filter(DBJob.id == job_id).first()
     if not job:
@@ -110,7 +119,7 @@ def get_job_status(job_id: str, db: Session = Depends(get_db)):
     )
 
 
-@app.get("/v1/jobs/{job_id}/logs", response_class=PlainTextResponse)
+@app.get("/v1/jobs/{job_id}/logs", response_class=PlainTextResponse, dependencies=[Depends(require_api_key)])
 def get_job_logs(job_id: str, db: Session = Depends(get_db)):
     job = db.query(DBJob).filter(DBJob.id == job_id).first()
     if not job:

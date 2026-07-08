@@ -12,6 +12,7 @@ import os
 
 os.environ.setdefault("GATEWAY_URL", "http://127.0.0.1:8000")
 os.environ.setdefault("INTERNAL_TOKEN", "local-dev-token")
+os.environ.setdefault("API_KEY", "local-dev-key")
 
 import k8s_ops
 from gateway import app

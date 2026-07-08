@@ -16,7 +16,11 @@ class ApiError(Exception):
     """Raised when the API returns an error response or is unreachable."""
 
 
-def submit_job(base_url: str, payload: dict) -> dict:
+def _headers(api_key: Optional[str]) -> dict:
+    return {"X-Api-Key": api_key} if api_key else {}
+
+
+def submit_job(base_url: str, payload: dict, api_key: Optional[str] = None) -> dict:
     """
     POST the job payload to /v1/jobs.
 
@@ -25,7 +29,7 @@ def submit_job(base_url: str, payload: dict) -> dict:
     """
     url = f"{base_url}/v1/jobs"
     try:
-        response = httpx.post(url, json=payload, timeout=30.0)
+        response = httpx.post(url, json=payload, headers=_headers(api_key), timeout=30.0)
     except httpx.ConnectError as e:
         raise ApiError(
             f"Could not connect to the API at {base_url}. "
@@ -40,7 +44,7 @@ def submit_job(base_url: str, payload: dict) -> dict:
     return response.json()
 
 
-def get_job_status(base_url: str, job_id: str) -> dict:
+def get_job_status(base_url: str, job_id: str, api_key: Optional[str] = None) -> dict:
     """
     GET /v1/jobs/{job_id}.
 
@@ -50,7 +54,7 @@ def get_job_status(base_url: str, job_id: str) -> dict:
     """
     url = f"{base_url}/v1/jobs/{job_id}"
     try:
-        response = httpx.get(url, timeout=30.0)
+        response = httpx.get(url, headers=_headers(api_key), timeout=30.0)
     except httpx.ConnectError as e:
         raise ApiError(
             f"Could not connect to the API at {base_url}. "
@@ -67,7 +71,7 @@ def get_job_status(base_url: str, job_id: str) -> dict:
     return response.json()
 
 
-def get_job_logs(base_url: str, job_id: str) -> str:
+def get_job_logs(base_url: str, job_id: str, api_key: Optional[str] = None) -> str:
     """
     GET /v1/jobs/{job_id}/logs.
 
@@ -77,7 +81,7 @@ def get_job_logs(base_url: str, job_id: str) -> str:
     """
     url = f"{base_url}/v1/jobs/{job_id}/logs"
     try:
-        response = httpx.get(url, timeout=30.0)
+        response = httpx.get(url, headers=_headers(api_key), timeout=30.0)
     except httpx.ConnectError as e:
         raise ApiError(
             f"Could not connect to the API at {base_url}. "
