@@ -4,6 +4,7 @@ gpujob CLI -- submits jobs to and queries status from the gpu-job-service API.
 Usage:
     gpujob submit -f job.yaml
     gpujob status job-a1b2c3d4
+    gpujob logs job-a1b2c3d4
 """
 
 from pathlib import Path
@@ -78,6 +79,22 @@ def status(
         raise typer.Exit(code=1)
 
     _print_status(result)
+
+
+@app.command()
+def logs(
+    job_id: str = typer.Argument(..., help="The job ID returned by 'gpujob submit'."),
+):
+    """Print the logs for a job, by ID."""
+    base_url = get_api_url()
+
+    try:
+        log_text = api_client.get_job_logs(base_url, job_id)
+    except api_client.ApiError as e:
+        err_console.print(f"[bold red]Error:[/bold red] {e}")
+        raise typer.Exit(code=1)
+
+    console.print(log_text, markup=False, highlight=False)
 
 
 def _print_status(result: dict) -> None:

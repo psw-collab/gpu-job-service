@@ -67,6 +67,31 @@ def get_job_status(base_url: str, job_id: str) -> dict:
     return response.json()
 
 
+def get_job_logs(base_url: str, job_id: str) -> str:
+    """
+    GET /v1/jobs/{job_id}/logs.
+
+    Returns the raw log text on success.
+    Raises ApiError with a human-readable message on any failure,
+    including a clear message for a 404 (unknown job, or logs no longer available).
+    """
+    url = f"{base_url}/v1/jobs/{job_id}/logs"
+    try:
+        response = httpx.get(url, timeout=30.0)
+    except httpx.ConnectError as e:
+        raise ApiError(
+            f"Could not connect to the API at {base_url}. "
+            f"Is the server running? ({e})"
+        ) from e
+    except httpx.TimeoutException as e:
+        raise ApiError(f"Request to {url} timed out.") from e
+
+    if response.status_code >= 400:
+        raise ApiError(_format_error(response))
+
+    return response.text
+
+
 def _format_error(response: httpx.Response) -> str:
     """Try to pull FastAPI's {"detail": "..."} out of an error response."""
     try:
