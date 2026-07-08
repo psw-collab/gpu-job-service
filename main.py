@@ -223,6 +223,21 @@ async def reconcile_loop():
                 for job in jobs:
                     job_id = job.id
                     try:
+                        # --- FIX #4: timeout check, before status lookup ---
+                        age_seconds = (datetime.now(timezone.utc) - job.submitted_at).total_seconds()
+                        if age_seconds > SCHEDULING_TIMEOUT_MINUTES * 60:
+                            job.status = "FAILED"
+                            job.failure_reason = "scheduling_timeout"
+                            job.status_message = (
+                                f"No GPUs of the requested type were available within the "
+                                f"{SCHEDULING_TIMEOUT_MINUTES}-minute timeout window. "
+                                f"Please try again or contact support."
+                            )
+                            job.completed_at = datetime.now(timezone.utc)
+                            db.commit()
+                            print(f"[timeout] job {job_id} exceeded {SCHEDULING_TIMEOUT_MINUTES}min, marked FAILED")
+                            continue
+                        
                         new_status = k8s_status(job_id)
                         if new_status is None:
                             continue
