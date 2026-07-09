@@ -13,7 +13,7 @@ import typer
 from rich.console import Console
 
 from . import api_client
-from .config import get_api_key, get_api_url
+from .config import get_api_key, get_api_url, get_identity_token
 from .job_config import JobConfigError, load_job_config
 
 app = typer.Typer(
@@ -56,7 +56,8 @@ def submit(
     base_url = get_api_url()
 
     try:
-        result = api_client.submit_job(base_url, payload, api_key=get_api_key())
+        result = api_client.submit_job(base_url, payload, api_key=get_api_key(),
+                                        identity_token=get_identity_token())
     except api_client.ApiError as e:
         err_console.print(f"[bold red]Error:[/bold red] {e}")
         raise typer.Exit(code=1)
@@ -73,7 +74,8 @@ def status(
     base_url = get_api_url()
 
     try:
-        result = api_client.get_job_status(base_url, job_id, api_key=get_api_key())
+        result = api_client.get_job_status(base_url, job_id, api_key=get_api_key(),
+                                            identity_token=get_identity_token())
     except api_client.ApiError as e:
         err_console.print(f"[bold red]Error:[/bold red] {e}")
         raise typer.Exit(code=1)
@@ -89,7 +91,8 @@ def logs(
     base_url = get_api_url()
 
     try:
-        log_text = api_client.get_job_logs(base_url, job_id, api_key=get_api_key())
+        log_text = api_client.get_job_logs(base_url, job_id, api_key=get_api_key(),
+                                            identity_token=get_identity_token())
     except api_client.ApiError as e:
         err_console.print(f"[bold red]Error:[/bold red] {e}")
         raise typer.Exit(code=1)
