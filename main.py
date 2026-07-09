@@ -3,6 +3,7 @@ import hashlib
 import secrets
 from datetime import datetime, timezone
 import os
+
 NAMESPACE = os.getenv("K8S_NAMESPACE", "tsonar-space")
 SCHEDULING_TIMEOUT_MINUTES = int(os.getenv("SCHEDULING_TIMEOUT_MINUTES", "30"))
 
@@ -21,8 +22,6 @@ from schemas import (
     JobStatusResponse,
 )
 
-import os
-
 try:
     config.load_incluster_config()
 except config.ConfigException:
@@ -34,7 +33,12 @@ if not NAMESPACE:
 core = client.CoreV1Api()
 batch = client.BatchV1Api()
 
+# Imported only after kube config is loaded: logs.py builds its own
+# CoreV1Api() at import time, which needs the client already configured.
+from logs import router as logs_router
+
 app = FastAPI(title="GPU Job-as-a-Service")
+app.include_router(logs_router)
 
 
 def generate_job_id(db: Session) -> str:
