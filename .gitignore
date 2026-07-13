@@ -3,3 +3,17 @@ __pycache__/
 *.pyc
 .env
 .vscode/
+
+# stray artifact, not an intentional file
+cli/gpujob
+
+# credentials -- never commit these
+*.pem
+*.key
+*-sa-key.json
+
+# local server logs
+*.log
+
+# personal Claude Code settings, not shared team config
+.claude/settings.local.json

@@ -19,6 +19,7 @@ class DBJob(Base):
     image_tag = Column(String(500), nullable=True)
     requirements_hash = Column(String(64), nullable=True)
     failure_reason = Column(Text, nullable=True)
+    logs = Column(Text, nullable=True)
     submitted_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     started_at = Column(DateTime(timezone=True), nullable=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)

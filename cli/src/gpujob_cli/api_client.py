@@ -16,7 +16,15 @@ class ApiError(Exception):
     """Raised when the API returns an error response or is unreachable."""
 
 
-def submit_job(base_url: str, payload: dict) -> dict:
+def _headers(api_key: Optional[str], identity_token: Optional[str] = None) -> dict:
+    headers = {"X-Api-Key": api_key} if api_key else {}
+    if identity_token:
+        headers["Authorization"] = f"Bearer {identity_token}"
+    return headers
+
+
+def submit_job(base_url: str, payload: dict, api_key: Optional[str] = None,
+                identity_token: Optional[str] = None) -> dict:
     """
     POST the job payload to /v1/jobs.
 
@@ -25,7 +33,7 @@ def submit_job(base_url: str, payload: dict) -> dict:
     """
     url = f"{base_url}/v1/jobs"
     try:
-        response = httpx.post(url, json=payload, timeout=30.0)
+        response = httpx.post(url, json=payload, headers=_headers(api_key, identity_token), timeout=30.0)
     except httpx.ConnectError as e:
         raise ApiError(
             f"Could not connect to the API at {base_url}. "
@@ -40,7 +48,8 @@ def submit_job(base_url: str, payload: dict) -> dict:
     return response.json()
 
 
-def get_job_status(base_url: str, job_id: str) -> dict:
+def get_job_status(base_url: str, job_id: str, api_key: Optional[str] = None,
+                    identity_token: Optional[str] = None) -> dict:
     """
     GET /v1/jobs/{job_id}.
 
@@ -50,7 +59,7 @@ def get_job_status(base_url: str, job_id: str) -> dict:
     """
     url = f"{base_url}/v1/jobs/{job_id}"
     try:
-        response = httpx.get(url, timeout=30.0)
+        response = httpx.get(url, headers=_headers(api_key, identity_token), timeout=30.0)
     except httpx.ConnectError as e:
         raise ApiError(
             f"Could not connect to the API at {base_url}. "
@@ -65,6 +74,32 @@ def get_job_status(base_url: str, job_id: str) -> dict:
         raise ApiError(_format_error(response))
 
     return response.json()
+
+
+def get_job_logs(base_url: str, job_id: str, api_key: Optional[str] = None,
+                  identity_token: Optional[str] = None) -> str:
+    """
+    GET /v1/jobs/{job_id}/logs.
+
+    Returns the raw log text on success.
+    Raises ApiError with a human-readable message on any failure,
+    including a clear message for a 404 (unknown job, or logs no longer available).
+    """
+    url = f"{base_url}/v1/jobs/{job_id}/logs"
+    try:
+        response = httpx.get(url, headers=_headers(api_key, identity_token), timeout=30.0)
+    except httpx.ConnectError as e:
+        raise ApiError(
+            f"Could not connect to the API at {base_url}. "
+            f"Is the server running? ({e})"
+        ) from e
+    except httpx.TimeoutException as e:
+        raise ApiError(f"Request to {url} timed out.") from e
+
+    if response.status_code >= 400:
+        raise ApiError(_format_error(response))
+
+    return response.text
 
 
 def _format_error(response: httpx.Response) -> str:

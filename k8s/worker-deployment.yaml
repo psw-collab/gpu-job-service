@@ -1,0 +1,91 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gpu-worker
+  namespace: sdara-space
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gpu-worker-role
+  namespace: sdara-space
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gpu-worker-rolebinding
+  namespace: sdara-space
+subjects:
+  - kind: ServiceAccount
+    name: gpu-worker
+    namespace: sdara-space
+roleRef:
+  kind: Role
+  name: gpu-worker-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-worker
+  namespace: sdara-space
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gpu-worker
+  template:
+    metadata:
+      labels:
+        app: gpu-worker
+    spec:
+      serviceAccountName: gpu-worker
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      containers:
+        - name: worker
+          image: ghcr.io/shizuka730/gpu-job-service-worker:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: K8S_NAMESPACE
+              value: sdara-space
+            - name: GATEWAY_URL
+              value: https://gpu-gateway-2511528587.us-central1.run.app
+            - name: INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: worker-internal-token
+                  key: INTERNAL_TOKEN
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"

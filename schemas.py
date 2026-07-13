@@ -7,8 +7,11 @@ ALLOWED_GPU_TYPES = {"A100", "H100"}
 ALLOWED_PYTHON_VERSIONS = {"3.11", "3.12", "3.13"}
 
 
+ENTRYPOINT_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]*\.py$"
+
+
 class JobSubmitRequest(BaseModel):
-    entrypoint: str
+    entrypoint: str = Field(pattern=ENTRYPOINT_PATTERN)
     entrypoint_content: str
     requirements: Optional[str] = None
     python_version: str = "3.11"
@@ -19,6 +22,17 @@ class JobSubmitRequest(BaseModel):
 class JobSubmitResponse(BaseModel):
     job_id: str
     status: str
+
+
+class JobReport(BaseModel):
+    """Body for POST /internal/jobs/{job_id}/report -- how the worker tells the
+    gateway about a status transition, without ever touching Postgres itself."""
+    status: str
+    status_message: Optional[str] = None
+    failure_reason: Optional[str] = None
+    logs: Optional[str] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
 
 
 class JobStatusResponse(BaseModel):

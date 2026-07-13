@@ -1,3 +1,12 @@
+"""
+Local single-process dev entrypoint: runs the gateway's HTTP routes and the
+worker's background loops in the same process, against whatever cluster your
+kubeconfig/VPN currently points at. The loops talk back to this same
+process's own HTTP server over loopback, exactly like the real worker talks
+to the real gateway over the internet -- just localhost instead of a public
+URL. For the actual GCP deployment, gateway.py and worker.py run as two
+separate services instead -- see k8s_ops.py.
+"""
 import asyncio
 import hashlib
 import secrets
@@ -213,43 +222,13 @@ def classify_pod_failure(job_id: str) -> str:
 
     return FAILURE_REASON_UNKNOWN
 
+import k8s_ops
+from gateway import app
 
-async def reconcile_loop():
-    while True:
-        try:
-            db = SessionLocal()
-            try:
-                jobs = db.query(DBJob).filter(DBJob.status.notin_(("SUCCEEDED", "FAILED"))).all()
-                for job in jobs:
-                    job_id = job.id
-                    try:
-                        new_status = k8s_status(job_id)
-                        if new_status is None:
-                            continue
-                        if new_status != job.status:
-                            job.status = new_status
-                            now = datetime.now(timezone.utc)
-                            if new_status == "RUNNING" and job.started_at is None:
-                                job.started_at = now
-                                job.status_message = "Job is running"
-                            if new_status == "SUCCEEDED":
-                                job.completed_at = now
-                                job.status_message = "Job completed successfully"
-                            if new_status == "FAILED":
-                                job.completed_at = now
-                                job.status_message = "Job failed"
-                                job.failure_reason = classify_pod_failure(job_id)
-                        db.commit()
-                    except Exception as e:
-                        print(f"reconcile error for {job_id}: {e}")
-                        db.rollback()
-            finally:
-                db.close()
-        except Exception as e:
-            print(f"reconcile loop error: {e}")
-        await asyncio.sleep(5)
+__all__ = ["app"]
 
 
 @app.on_event("startup")
-async def start_reconciler():
-    asyncio.create_task(reconcile_loop())
+async def start_background_loops():
+    asyncio.create_task(k8s_ops.reconcile_loop())
+    asyncio.create_task(k8s_ops.gc_loop())
