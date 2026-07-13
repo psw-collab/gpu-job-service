@@ -117,8 +117,21 @@ def k8s_status(job_id: str) -> str | None:
     if s.failed:
         return "FAILED"
     if s.active:
-        return "RUNNING"
+        # Job.status.active only means "has a non-terminal pod" -- it's set as
+        # soon as the pod object exists, even while still Pending (e.g. stuck
+        # unschedulable). Check the pod's actual phase so we don't report
+        # RUNNING before the container has actually started, which would also
+        # let it skip past the SCHEDULED-only scheduling timeout.
+        return "RUNNING" if _pod_is_running(job_id) else "SCHEDULED"
     return "SCHEDULED"
+
+
+def _pod_is_running(job_id: str) -> bool:
+    try:
+        pods = core.list_namespaced_pod(NAMESPACE, label_selector=f"job-name={job_id}").items
+    except client.ApiException:
+        return False
+    return bool(pods) and pods[0].status.phase == "Running"
 
 
 def classify_pod_failure(job_id: str) -> str:
