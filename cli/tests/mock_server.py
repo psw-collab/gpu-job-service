@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 app = FastAPI()
@@ -59,6 +60,7 @@ def submit_job(request: JobSubmitRequest):
         "submitted_at": datetime.now(timezone.utc),
         "started_at": None,
         "completed_at": None,
+        "logs": None,
     }
     return JobSubmitResponse(job_id=job_id, status="PENDING")
 
@@ -69,3 +71,26 @@ def get_job_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
     return JobStatusResponse(**job)
+
+
+@app.get("/v1/jobs/{job_id}/logs", response_class=PlainTextResponse)
+def get_job_logs(job_id: str):
+    """Mirror the real gateway's log semantics exactly (gateway.py):
+    200 + text when logs exist, 404 for a terminal job with none, 409 while
+    the job hasn't produced any yet."""
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    logs = job.get("logs")
+    if logs is not None:
+        return logs
+
+    if job["status"] in ("SUCCEEDED", "FAILED"):
+        raise HTTPException(status_code=404, detail="No logs were captured for this job.")
+
+    raise HTTPException(
+        status_code=409,
+        detail=f"Logs are not available yet -- job is currently {job['status']}. "
+               f"Try again once it starts running.",
+    )

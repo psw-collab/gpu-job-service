@@ -5,9 +5,11 @@ Usage:
     gpujob submit -f job.yaml
     gpujob status job-a1b2c3d4
     gpujob logs job-a1b2c3d4
+    gpujob logs -f job-a1b2c3d4
 """
 
 from pathlib import Path
+import time
 
 import typer
 from rich.console import Console
@@ -83,21 +85,102 @@ def status(
     _print_status(result)
 
 
+_TERMINAL_STATES = {"SUCCEEDED", "FAILED"}
+
+
 @app.command()
 def logs(
     job_id: str = typer.Argument(..., help="The job ID returned by 'gpujob submit'."),
+    follow: bool = typer.Option(
+        False,
+        "-f",
+        "--follow",
+        help="Stream new log output as the job runs, until it finishes (like 'tail -f').",
+    ),
+    interval: float = typer.Option(
+        2.0,
+        "--interval",
+        help="Seconds between polls when following (default: 2).",
+        min=0.5,
+    ),
 ):
-    """Print the logs for a job, by ID."""
+    """
+    Print the logs for a job, by ID.
+
+    Without --follow, prints whatever logs are available right now and exits.
+    With --follow, polls until the job reaches a terminal state, printing only
+    newly-appended output each time.
+    """
     base_url = get_api_url()
 
-    try:
-        log_text = api_client.get_job_logs(base_url, job_id, api_key=get_api_key(),
-                                            identity_token=get_identity_token())
-    except api_client.ApiError as e:
-        err_console.print(f"[bold red]Error:[/bold red] {e}")
-        raise typer.Exit(code=1)
+    if not follow:
+        try:
+            log_text = api_client.get_job_logs(base_url, job_id, api_key=get_api_key(),
+                                                identity_token=get_identity_token())
+        except api_client.ApiError as e:
+            err_console.print(f"[bold red]Error:[/bold red] {e}")
+            raise typer.Exit(code=1)
+        console.print(log_text, markup=False, highlight=False)
+        return
 
-    console.print(log_text, markup=False, highlight=False)
+    _follow_logs(base_url, job_id, interval)
+
+
+def _follow_logs(base_url: str, job_id: str, interval: float) -> None:
+    """
+    Poll the status and logs endpoints until the job is terminal, printing only
+    the newly-appended tail each iteration.
+
+    The gateway returns 409 while the job hasn't produced logs yet and 404 for a
+    terminal job that captured none; both are treated as "nothing new yet" here.
+    Because the server may only expose the full log at completion today, this
+    still works end to end -- it just prints everything in one go when the job
+    finishes. Once the backend ships partial logs during RUNNING, the same code
+    starts printing incremental output with no CLI change.
+    """
+    api_key = get_api_key()
+    identity_token = get_identity_token()
+    printed = 0
+    waiting_notified = False
+
+    while True:
+        try:
+            status_result = api_client.get_job_status(
+                base_url, job_id, api_key=api_key, identity_token=identity_token
+            )
+        except api_client.ApiError as e:
+            err_console.print(f"[bold red]Error:[/bold red] {e}")
+            raise typer.Exit(code=1)
+
+        status = status_result.get("status", "UNKNOWN")
+
+        try:
+            log_text = api_client.get_job_logs(
+                base_url, job_id, api_key=api_key, identity_token=identity_token
+            )
+        except api_client.ApiError as e:
+            if e.status_code in (404, 409):
+                log_text = ""
+            else:
+                err_console.print(f"[bold red]Error:[/bold red] {e}")
+                raise typer.Exit(code=1)
+
+        if len(log_text) > printed:
+            console.print(log_text[printed:], markup=False, highlight=False, end="")
+            printed = len(log_text)
+
+        if status in _TERMINAL_STATES:
+            if printed == 0:
+                console.print("[dim](no logs were captured for this job)[/dim]")
+            else:
+                console.print()  # ensure the shell prompt lands on a fresh line
+            return
+
+        if printed == 0 and not waiting_notified:
+            err_console.print(f"[dim]Waiting for logs (job is {status})...[/dim]")
+            waiting_notified = True
+
+        time.sleep(interval)
 
 
 def _print_status(result: dict) -> None:
