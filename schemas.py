@@ -12,7 +12,12 @@ ENTRYPOINT_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]*\.py$"
 
 class JobSubmitRequest(BaseModel):
     entrypoint: str = Field(pattern=ENTRYPOINT_PATTERN)
-    entrypoint_content: str
+    # Exactly one of these two must be set: entrypoint_content for the
+    # legacy single-file mode (raw script text), source_archive_b64 for the
+    # multi-file mode (base64-encoded tar.gz of a whole project directory,
+    # built into an image via Kaniko -- see kaniko.md). Validated in gateway.py.
+    entrypoint_content: Optional[str] = None
+    source_archive_b64: Optional[str] = None
     requirements: Optional[str] = None
     python_version: str = "3.11"
     gpu_type: str = "A100"
@@ -31,7 +36,9 @@ class JobReport(BaseModel):
     status_message: Optional[str] = None
     failure_reason: Optional[str] = None
     logs: Optional[str] = None
+    image_tag: Optional[str] = None
     started_at: Optional[datetime] = None
+    scheduled_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
 
 

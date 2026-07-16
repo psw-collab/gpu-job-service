@@ -1,7 +1,7 @@
 """
 Parsing and client-side validation for job.yaml config files.
 
-Expected job.yaml shape:
+Expected job.yaml shape (single-file, legacy mode):
 
     entrypoint: train.py
     requirements: requirements.txt
@@ -17,8 +17,24 @@ contents and sends the raw text to the API.
 
 `requirements` is optional -- a job with no dependencies beyond the base
 image is valid.
+
+Multi-file mode: add a `context` key pointing at a project directory
+(resolved relative to the yaml file, like `entrypoint`/`requirements`):
+
+    entrypoint: train.py
+    requirements: requirements.txt
+    context: .
+
+When `context` is set, `entrypoint`/`requirements` are paths *relative to
+that directory* rather than files read for their raw content -- the whole
+directory gets packaged into a tar.gz archive and sent to the API instead,
+which builds a container image from it (see the Kaniko design doc). Without
+`context`, behavior is unchanged from the single-file mode above.
 """
 
+import base64
+import io
+import tarfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -37,24 +53,33 @@ class JobConfigError(Exception):
     """Raised for any problem reading or validating a job.yaml file."""
 
 
+# Directories excluded when packaging a `context` directory into an archive.
+# Not .gitignore-aware -- just a small, common-sense denylist.
+_ARCHIVE_EXCLUDE_NAMES = {".git", "__pycache__", "venv", ".venv", "node_modules"}
+
+
 @dataclass
 class JobConfig:
     entrypoint_name: str
-    entrypoint_content: str
+    entrypoint_content: Optional[str]
     requirements_content: Optional[str]
     python_version: str
     gpu_type: str
     gpu_count: int
+    source_archive_b64: Optional[str] = None
 
     def to_request_payload(self) -> dict:
         """Build the JSON body expected by POST /v1/jobs."""
         payload = {
             "entrypoint": self.entrypoint_name,
-            "entrypoint_content": self.entrypoint_content,
             "python_version": self.python_version,
             "gpu_type": self.gpu_type,
             "gpu_count": self.gpu_count,
         }
+        if self.source_archive_b64 is not None:
+            payload["source_archive_b64"] = self.source_archive_b64
+        else:
+            payload["entrypoint_content"] = self.entrypoint_content
         if self.requirements_content is not None:
             payload["requirements"] = self.requirements_content
         return payload
@@ -92,11 +117,25 @@ def _require_str(data: dict, field: str, yaml_path: Path) -> str:
     return value
 
 
+def _build_source_archive(context_path: Path) -> str:
+    """Tar.gz `context_path` (excluding common noise dirs), base64-encoded for JSON transport."""
+
+    def _filter(tarinfo: tarfile.TarInfo) -> Optional[tarfile.TarInfo]:
+        if any(part in _ARCHIVE_EXCLUDE_NAMES for part in Path(tarinfo.name).parts):
+            return None
+        return tarinfo
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(context_path, arcname=".", filter=_filter)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
 def load_job_config(yaml_path: Path) -> JobConfig:
     """
     Read and validate a job.yaml file, resolving and checking referenced
-    files (entrypoint script, requirements file) relative to the yaml
-    file's own directory.
+    files (entrypoint script, requirements file, and optionally a project
+    `context` directory) relative to the yaml file's own directory.
 
     Raises JobConfigError on any validation failure, with a message that
     points at exactly what's wrong.
@@ -121,9 +160,23 @@ def load_job_config(yaml_path: Path) -> JobConfig:
             f"{yaml_path}: top-level YAML content must be a mapping of fields"
         )
 
-    # entrypoint: required, must point to a real file
+    # context: optional. If present, entrypoint/requirements are resolved
+    # relative to it (and only checked for existence, not read for content) --
+    # the whole directory is packaged into an archive instead.
+    context_path = None
+    if "context" in data and data["context"] is not None:
+        context_str = _require_str(data, "context", yaml_path)
+        context_path = (yaml_path.parent / context_str).resolve()
+        if not context_path.exists():
+            raise JobConfigError(f"{yaml_path}: context directory not found: {context_str}")
+        if not context_path.is_dir():
+            raise JobConfigError(f"{yaml_path}: context is not a directory: {context_str}")
+
+    base_dir = context_path if context_path is not None else yaml_path.parent
+
+    # entrypoint: required, must point to a real file (relative to base_dir)
     entrypoint_str = _require_str(data, "entrypoint", yaml_path)
-    entrypoint_path = (yaml_path.parent / entrypoint_str).resolve()
+    entrypoint_path = (base_dir / entrypoint_str).resolve()
     if not entrypoint_path.exists():
         raise JobConfigError(
             f"{yaml_path}: entrypoint file not found: {entrypoint_str}"
@@ -133,11 +186,12 @@ def load_job_config(yaml_path: Path) -> JobConfig:
             f"{yaml_path}: entrypoint is not a file: {entrypoint_str}"
         )
 
-    # requirements: optional, but if present must point to a real file
+    # requirements: optional, but if present must point to a real file (relative to base_dir)
     requirements_path = None
+    requirements_str = None
     if "requirements" in data and data["requirements"] is not None:
         requirements_str = _require_str(data, "requirements", yaml_path)
-        requirements_path = (yaml_path.parent / requirements_str).resolve()
+        requirements_path = (base_dir / requirements_str).resolve()
         if not requirements_path.exists():
             raise JobConfigError(
                 f"{yaml_path}: requirements file not found: {requirements_str}"
@@ -177,18 +231,33 @@ def load_job_config(yaml_path: Path) -> JobConfig:
             f"{MAX_GPU_COUNT}, got {gpu_count}"
         )
 
-    entrypoint_content = _read_text_file(entrypoint_path, yaml_path, "entrypoint")
-    requirements_content = None
-    if requirements_path is not None:
-        requirements_content = _read_text_file(
-            requirements_path, yaml_path, "requirements"
+    if context_path is not None:
+        # Multi-file mode: entrypoint/requirements travel as relative paths
+        # inside the archive, not as raw text.
+        entrypoint_name = str(entrypoint_path.relative_to(context_path))
+        requirements_content = (
+            str(requirements_path.relative_to(context_path))
+            if requirements_path is not None
+            else None
         )
+        entrypoint_content = None
+        source_archive_b64 = _build_source_archive(context_path)
+    else:
+        entrypoint_name = entrypoint_path.name
+        entrypoint_content = _read_text_file(entrypoint_path, yaml_path, "entrypoint")
+        requirements_content = (
+            _read_text_file(requirements_path, yaml_path, "requirements")
+            if requirements_path is not None
+            else None
+        )
+        source_archive_b64 = None
 
     return JobConfig(
-        entrypoint_name=entrypoint_path.name,
+        entrypoint_name=entrypoint_name,
         entrypoint_content=entrypoint_content,
         requirements_content=requirements_content,
         python_version=python_version,
         gpu_type=gpu_type,
         gpu_count=gpu_count,
+        source_archive_b64=source_archive_b64,
     )
