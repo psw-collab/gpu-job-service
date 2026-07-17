@@ -36,6 +36,11 @@ if not INTERNAL_TOKEN:
 
 _HEADERS = {"X-Internal-Token": INTERNAL_TOKEN}
 
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "")
+MINIO_BUCKET = os.getenv("MINIO_BUCKET", "job-outputs")
+
 FAILURE_REASON_OOM = "Your job ran out of memory. Try requesting more memory or reducing batch size."
 FAILURE_REASON_NODE = "A hardware issue interrupted your job. This is not a problem with your code, please resubmit."
 FAILURE_REASON_USER_CODE = "Your job exited with an error. Check the logs for the full traceback."
@@ -70,6 +75,7 @@ GPU_ACCELERATOR_NODE_SELECTOR = "cloud.google.com/gke-accelerator"
 GPU_TYPE_TO_ACCELERATOR = {
     "A100": "nvidia-tesla-a100",
     "H100": "nvidia-h100-80gb",
+    "T4": "nvidia-tesla-t4",
 }
 
 
@@ -120,12 +126,39 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
     """Legacy single-file path: run straight off python:{python_version}-slim,
     with the script/requirements mounted via ConfigMap and pip install at pod
     startup. Used when the job wasn't submitted with a `context` archive."""
+    uploader_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upload_outputs.py")
+    with open(uploader_path) as f:
+        uploader_content = f.read()
+
+    # Run the uploader after the entrypoint regardless of outcome, but the
+    # container must still exit with the entrypoint's own exit code so job
+    # success/failure classification (k8s_status / classify_pod_failure)
+    # keeps reflecting the user's script, not the uploader.
+    command = (
+        "mkdir -p /outputs\n"
+        "pip install -r /scripts/requirements.txt 2>/dev/null\n"
+        "pip install boto3 2>/dev/null\n"
+        f"python /scripts/{entrypoint}\n"
+        "ENTRYPOINT_EXIT=$?\n"
+        'python /scripts/upload_outputs.py || echo "output upload failed"\n'
+        "exit $ENTRYPOINT_EXIT"
+    )
     container = client.V1Container(
         name="runner",
         image=f"python:{python_version}-slim",
-        command=["sh", "-c",
-                 f"pip install -r /scripts/requirements.txt 2>/dev/null; python /scripts/{entrypoint}"],
-        volume_mounts=[client.V1VolumeMount(name="code", mount_path="/scripts")],
+        command=["sh", "-c", command],
+        volume_mounts=[
+            client.V1VolumeMount(name="code", mount_path="/scripts"),
+            client.V1VolumeMount(name="outputs", mount_path="/outputs"),
+        ],
+        env=[
+            client.V1EnvVar(name="MINIO_ENDPOINT", value=MINIO_ENDPOINT),
+            client.V1EnvVar(name="MINIO_ACCESS_KEY", value=MINIO_ACCESS_KEY),
+            client.V1EnvVar(name="MINIO_SECRET_KEY", value=MINIO_SECRET_KEY),
+            client.V1EnvVar(name="MINIO_BUCKET", value=MINIO_BUCKET),
+            client.V1EnvVar(name="JOB_ID", value=job_id),
+            client.V1EnvVar(name="OUTPUTS_DIR", value="/outputs"),
+        ],
         resources=client.V1ResourceRequirements(
             limits={"nvidia.com/gpu": str(gpu_count)},
         ),
@@ -135,9 +168,14 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
         restart_policy="Never",
         containers=[container],
         node_selector=_gpu_node_selector(gpu_type),
-        volumes=[client.V1Volume(
-            name="code",
-            config_map=client.V1ConfigMapVolumeSource(name=cm_name))],
+        volumes=[
+            client.V1Volume(
+                name="code",
+                config_map=client.V1ConfigMapVolumeSource(name=cm_name)),
+            client.V1Volume(
+                name="outputs",
+                empty_dir=client.V1EmptyDirVolumeSource()),
+        ],
     )
     created_job = batch.create_namespaced_job(
         NAMESPACE,
@@ -153,7 +191,11 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
         NAMESPACE,
         client.V1ConfigMap(
             metadata=client.V1ObjectMeta(name=cm_name, owner_references=[_owner_reference_for(created_job)]),
-            data={entrypoint: entrypoint_content, "requirements.txt": requirements or ""},
+            data={
+                entrypoint: entrypoint_content,
+                "requirements.txt": requirements or "",
+                "upload_outputs.py": uploader_content,
+            },
         ),
     )
 

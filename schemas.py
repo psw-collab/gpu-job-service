@@ -3,7 +3,7 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
-ALLOWED_GPU_TYPES = {"A100", "H100"}
+ALLOWED_GPU_TYPES = {"A100", "H100", "T4"}
 ALLOWED_PYTHON_VERSIONS = {"3.11", "3.12", "3.13"}
 
 
