@@ -13,7 +13,16 @@ import httpx
 
 
 class ApiError(Exception):
-    """Raised when the API returns an error response or is unreachable."""
+    """Raised when the API returns an error response or is unreachable.
+
+    ``status_code`` is the HTTP status when the failure came from an API
+    response (None for connection/timeout errors). ``logs --follow`` uses it
+    to tell "logs not ready yet" (409) apart from real failures.
+    """
+
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _headers(api_key: Optional[str], identity_token: Optional[str] = None) -> dict:
@@ -69,9 +78,9 @@ def get_job_status(base_url: str, job_id: str, api_key: Optional[str] = None,
         raise ApiError(f"Request to {url} timed out.") from e
 
     if response.status_code == 404:
-        raise ApiError(f"No job found with ID '{job_id}'.")
+        raise ApiError(f"No job found with ID '{job_id}'.", status_code=404)
     if response.status_code >= 400:
-        raise ApiError(_format_error(response))
+        raise ApiError(_format_error(response), status_code=response.status_code)
 
     return response.json()
 
@@ -97,7 +106,7 @@ def get_job_logs(base_url: str, job_id: str, api_key: Optional[str] = None,
         raise ApiError(f"Request to {url} timed out.") from e
 
     if response.status_code >= 400:
-        raise ApiError(_format_error(response))
+        raise ApiError(_format_error(response), status_code=response.status_code)
 
     return response.text
 

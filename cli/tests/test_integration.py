@@ -7,6 +7,7 @@ including that the server accepts `entrypoint_content`. It skips cleanly if
 fastapi isn't installed (run `pip install -e ".[test]"` to enable it).
 """
 
+import time
 from pathlib import Path
 
 import httpx
@@ -19,6 +20,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from gpujob_cli import api_client  # noqa: E402
 from gpujob_cli.cli import app  # noqa: E402
+from tests import mock_server  # noqa: E402
 from tests.mock_server import app as mock_app  # noqa: E402
 
 runner = CliRunner()
@@ -29,13 +31,13 @@ def route_cli_to_mock(monkeypatch):
     """Send the CLI's httpx calls into the in-process mock server."""
     client = TestClient(mock_app)
 
-    def fake_post(url, json, timeout):
+    def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
         path = url.split("9002", 1)[1] if "9002" in url else url
-        return client.post(path, json=json)
+        return client.post(path, json=json, headers=headers or {})
 
-    def fake_get(url, timeout):
+    def fake_get(url, headers=None, timeout=None, **kwargs):
         path = url.split("9002", 1)[1] if "9002" in url else url
-        return client.get(path)
+        return client.get(path, headers=headers or {})
 
     monkeypatch.setattr(httpx, "post", fake_post)
     monkeypatch.setattr(httpx, "get", fake_get)
@@ -79,3 +81,45 @@ def test_status_unknown_job_is_404(route_cli_to_mock):
     result = runner.invoke(app, ["status", "job-nope"])
     assert result.exit_code == 1
     assert "No job found" in result.output
+
+
+def _seed(job_id, status, logs=None):
+    """Put a job straight into the mock's store for log-path tests."""
+    from datetime import datetime, timezone
+    mock_server._jobs[job_id] = {
+        "id": job_id,
+        "status": status,
+        "status_message": status.title(),
+        "entrypoint": "train.py",
+        "python_version": "3.11",
+        "gpu_type": "A100",
+        "gpu_count": 1,
+        "failure_reason": None,
+        "submitted_at": datetime.now(timezone.utc),
+        "started_at": None,
+        "completed_at": None,
+        "logs": logs,
+    }
+
+
+def test_logs_oneshot_end_to_end(route_cli_to_mock):
+    _seed("job-done", "SUCCEEDED", logs="epoch 1 loss=0.5\nepoch 2 loss=0.3\n")
+    result = runner.invoke(app, ["logs", "job-done"])
+    assert result.exit_code == 0, result.output
+    assert "epoch 1 loss=0.5" in result.stdout
+    assert "epoch 2 loss=0.3" in result.stdout
+
+
+def test_logs_oneshot_not_ready_is_409(route_cli_to_mock):
+    _seed("job-pending", "PENDING", logs=None)
+    result = runner.invoke(app, ["logs", "job-pending"])
+    assert result.exit_code == 1
+    assert "not available yet" in result.output.lower()
+
+
+def test_logs_follow_end_to_end_terminal(route_cli_to_mock, monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
+    _seed("job-fin", "SUCCEEDED", logs="all done\n")
+    result = runner.invoke(app, ["logs", "-f", "job-fin"])
+    assert result.exit_code == 0, result.output
+    assert "all done" in result.stdout
