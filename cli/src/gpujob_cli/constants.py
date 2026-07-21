@@ -14,7 +14,6 @@ MAX_GPU_COUNT = 8
 ALLOWED_GPU_TYPES = {
     "A100",
     "H100",
-    "T4",
 }
 
 ALLOWED_PYTHON_VERSIONS = {

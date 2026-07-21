@@ -1,6 +1,0 @@
-entrypoint: train.py
-requirements: requirements.txt
-context: .
-python_version: "3.11"
-gpu_type: T4
-gpu_count: 1

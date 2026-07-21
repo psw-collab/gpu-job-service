@@ -1,5 +1,5 @@
 entrypoint: train.py
 requirements: requirements.txt
 python_version: "3.11"
-gpu_type: T4
+gpu_type: A100
 gpu_count: 1

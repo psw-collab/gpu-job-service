@@ -188,7 +188,6 @@ def _print_status(result: dict) -> None:
     status_value = result.get("status", "UNKNOWN")
     status_colors = {
         "PENDING": "yellow",
-        "BUILDING": "yellow",
         "SCHEDULED": "yellow",
         "RUNNING": "cyan",
         "SUCCEEDED": "green",
