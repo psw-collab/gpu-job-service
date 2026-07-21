@@ -41,6 +41,19 @@ MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "")
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "job-outputs")
 
+# Distinct from MINIO_ENDPOINT above: that one is whatever the outer shell
+# has set (e.g. localhost:9000 for a developer's own convenience), which is
+# meaningless inside a job pod -- "localhost" there is the pod itself, not
+# this machine. Job pods always get IN_CLUSTER_MINIO_ENDPOINT instead, which
+# defaults to the in-cluster Service DNS name so it works with no extra
+# config as long as MinIO is deployed in the same namespace as the jobs.
+IN_CLUSTER_MINIO_ENDPOINT = os.getenv(
+    "IN_CLUSTER_MINIO_ENDPOINT", f"http://minio-service.{NAMESPACE}.svc.cluster.local:9000"
+)
+
+GPU_ENABLED = os.getenv("GPU_ENABLED", "false").lower() == "true"
+GPU_ACCELERATOR_TYPE = os.getenv("GPU_ACCELERATOR_TYPE", "nvidia-l4")
+
 FAILURE_REASON_OOM = "Your job ran out of memory. Try requesting more memory or reducing batch size."
 FAILURE_REASON_NODE = "A hardware issue interrupted your job. This is not a problem with your code, please resubmit."
 FAILURE_REASON_USER_CODE = "Your job exited with an error. Check the logs for the full traceback."
@@ -102,6 +115,16 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
         'python /scripts/upload_outputs.py || echo "output upload failed"\n'
         "exit $ENTRYPOINT_EXIT"
     )
+    # GPU requesting is env-gated so we can run the full pipeline on a
+    # CPU-only cluster today and switch to real GPUs later with no code
+    # change. Autopilot requires the accelerator node_selector alongside the
+    # nvidia.com/gpu limit, or it rejects the pod -- so both are added together.
+    resources = None
+    node_selector = None
+    if GPU_ENABLED:
+        resources = client.V1ResourceRequirements(limits={"nvidia.com/gpu": str(gpu_count)})
+        node_selector = {"cloud.google.com/gke-accelerator": GPU_ACCELERATOR_TYPE}
+
     container = client.V1Container(
         name="runner",
         image=f"python:{python_version}-slim",
@@ -111,16 +134,14 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
             client.V1VolumeMount(name="outputs", mount_path="/outputs"),
         ],
         env=[
-            client.V1EnvVar(name="MINIO_ENDPOINT", value=MINIO_ENDPOINT),
+            client.V1EnvVar(name="MINIO_ENDPOINT", value=IN_CLUSTER_MINIO_ENDPOINT),
             client.V1EnvVar(name="MINIO_ACCESS_KEY", value=MINIO_ACCESS_KEY),
             client.V1EnvVar(name="MINIO_SECRET_KEY", value=MINIO_SECRET_KEY),
             client.V1EnvVar(name="MINIO_BUCKET", value=MINIO_BUCKET),
             client.V1EnvVar(name="JOB_ID", value=job_id),
             client.V1EnvVar(name="OUTPUTS_DIR", value="/outputs"),
         ],
-        resources=client.V1ResourceRequirements(
-            limits={"nvidia.com/gpu": str(gpu_count)},
-        ),
+        resources=resources,
     )
     pod_spec = client.V1PodSpec(
         restart_policy="Never",
@@ -133,6 +154,7 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
                 name="outputs",
                 empty_dir=client.V1EmptyDirVolumeSource()),
         ],
+        node_selector=node_selector,
     )
     batch.create_namespaced_job(
         NAMESPACE,
