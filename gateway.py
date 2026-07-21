@@ -9,13 +9,15 @@ DB access either -- the colo cluster's network blocks arbitrary outbound
 ports, so the worker talks to the /internal/* endpoints below over plain
 HTTPS instead, authenticated with a shared token.
 """
+import base64
+import binascii
 import hashlib
 import os
 import secrets
 from datetime import datetime, timezone, timedelta
 
 from fastapi import FastAPI, Depends, HTTPException, Header
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -73,6 +75,19 @@ def submit_job(request: JobSubmitRequest, db: Session = Depends(get_db)):
             detail=f"Unsupported python_version '{request.python_version}'. Allowed: {', '.join(sorted(ALLOWED_PYTHON_VERSIONS))}",
         )
 
+    if (request.entrypoint_content is None) == (request.source_archive_b64 is None):
+        raise HTTPException(
+            status_code=422,
+            detail="Exactly one of entrypoint_content or source_archive_b64 must be provided.",
+        )
+
+    source_archive = None
+    if request.source_archive_b64 is not None:
+        try:
+            source_archive = base64.b64decode(request.source_archive_b64, validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(status_code=422, detail="source_archive_b64 is not valid base64.")
+
     job_id = generate_job_id(db)
 
     req_hash = None
@@ -83,6 +98,7 @@ def submit_job(request: JobSubmitRequest, db: Session = Depends(get_db)):
         id=job_id,
         entrypoint=request.entrypoint,
         entrypoint_content=request.entrypoint_content,
+        source_archive=source_archive,
         requirements=request.requirements,
         python_version=request.python_version,
         gpu_type=request.gpu_type,
@@ -148,14 +164,27 @@ def list_active_jobs(db: Session = Depends(get_db)):
             "status": j.status,
             "entrypoint": j.entrypoint,
             "entrypoint_content": j.entrypoint_content,
+            "has_archive": j.source_archive is not None,
             "requirements": j.requirements,
             "python_version": j.python_version,
+            "gpu_type": j.gpu_type,
             "gpu_count": j.gpu_count,
             "submitted_at": j.submitted_at.isoformat(),
             "started_at": j.started_at.isoformat() if j.started_at else None,
+            "scheduled_at": j.scheduled_at.isoformat() if j.scheduled_at else None,
         }
         for j in jobs
     ]
+
+
+@app.get("/internal/jobs/{job_id}/source", dependencies=[Depends(require_internal_token)])
+def get_job_source(job_id: str, db: Session = Depends(get_db)):
+    job = db.query(DBJob).filter(DBJob.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    if job.source_archive is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} has no source archive")
+    return Response(content=job.source_archive, media_type="application/gzip")
 
 
 @app.post("/internal/jobs/{job_id}/report", dependencies=[Depends(require_internal_token)])
@@ -171,8 +200,12 @@ def report_job(job_id: str, report: JobReport, db: Session = Depends(get_db)):
         job.failure_reason = report.failure_reason
     if report.logs is not None:
         job.logs = report.logs
+    if report.image_tag is not None:
+        job.image_tag = report.image_tag
     if report.started_at is not None:
         job.started_at = report.started_at
+    if report.scheduled_at is not None:
+        job.scheduled_at = report.scheduled_at
     if report.completed_at is not None:
         job.completed_at = report.completed_at
     db.commit()
