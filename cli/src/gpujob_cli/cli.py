@@ -6,13 +6,17 @@ Usage:
     gpujob status job-a1b2c3d4
     gpujob logs job-a1b2c3d4
     gpujob logs -f job-a1b2c3d4
+    gpujob outputs job-a1b2c3d4
+    gpujob outputs job-a1b2c3d4 --download --dest ./results
 """
 
 from pathlib import Path
+from typing import Optional
 import time
 
 import typer
 from rich.console import Console
+from rich.table import Table
 
 from . import api_client
 from .config import get_api_key, get_api_url, get_identity_token
@@ -181,6 +185,125 @@ def _follow_logs(base_url: str, job_id: str, interval: float) -> None:
             waiting_notified = True
 
         time.sleep(interval)
+
+
+@app.command()
+def outputs(
+    job_id: str = typer.Argument(..., help="The job ID returned by 'gpujob submit'."),
+    download: bool = typer.Option(
+        False,
+        "-d",
+        "--download",
+        help="Download the output files instead of just listing them.",
+    ),
+    dest: Optional[Path] = typer.Option(
+        None,
+        "--dest",
+        help="Directory to download into (with --download). Subdirectory "
+             "structure is preserved. Defaults to ./<job-id>/.",
+    ),
+):
+    """
+    List (or download) the files a job wrote to its /outputs directory.
+
+    Without --download, prints a table of the available files and their sizes.
+    With --download, fetches each file into --dest (default ./<job-id>/),
+    recreating any subdirectories (e.g. models/best.pt).
+    """
+    base_url = get_api_url()
+
+    try:
+        result = api_client.get_job_outputs(base_url, job_id, api_key=get_api_key(),
+                                             identity_token=get_identity_token())
+    except api_client.ApiError as e:
+        if e.status_code == 409:
+            console.print(
+                "[yellow]Outputs aren't available yet -- this job is still running. "
+                "Check back once it completes.[/yellow]"
+            )
+            raise typer.Exit(code=1)
+        err_console.print(f"[bold red]Error:[/bold red] {e}")
+        raise typer.Exit(code=1)
+
+    files = result.get("outputs", [])
+    status = result.get("status")
+    if not files:
+        note = f" (job {status})" if status else ""
+        console.print(f"[dim]This job produced no output files{note}.[/dim]")
+        return
+
+    if not download:
+        _print_outputs_table(files, status)
+        return
+
+    download_dir = dest if dest is not None else Path(job_id)
+    _download_outputs(files, download_dir)
+
+
+def _print_outputs_table(files: list, status: Optional[str] = None) -> None:
+    """Render the output file listing as a table."""
+    if status:
+        console.print(f"Job status: [bold]{status}[/bold]")
+    table = Table(show_edge=False, header_style="bold")
+    table.add_column("File")
+    table.add_column("Size", justify="right")
+    for entry in files:
+        table.add_row(entry.get("path", "-"), _human_size(entry.get("size_bytes")))
+    console.print(table)
+    console.print(f"\n{len(files)} file(s). Re-run with --download to fetch them.")
+
+
+def _download_outputs(files: list, dest: Path) -> None:
+    """Download every output file into ``dest``, preserving subdirectories."""
+    written = 0
+    for entry in files:
+        rel = entry.get("path")
+        url = entry.get("url")
+        if not rel or not url:
+            err_console.print(f"[yellow]Skipping malformed output entry:[/yellow] {entry}")
+            continue
+
+        target = _safe_join(dest, rel)
+        if target is None:
+            err_console.print(f"[yellow]Skipping output with suspicious path:[/yellow] {rel}")
+            continue
+
+        try:
+            api_client.download_output(url, target)
+        except api_client.ApiError as e:
+            err_console.print(f"[bold red]Error downloading {rel}:[/bold red] {e}")
+            raise typer.Exit(code=1)
+
+        console.print(f"  {rel} -> {target}")
+        written += 1
+
+    console.print(f"Downloaded [bold green]{written}[/bold green] file(s) to {dest}")
+
+
+def _safe_join(dest: Path, rel: str) -> Optional[Path]:
+    """
+    Join a server-provided relative path onto ``dest``, refusing anything that
+    would escape ``dest`` (absolute paths, or '..' traversal). Returns the
+    resolved target path, or None if the path is unsafe.
+    """
+    candidate = (dest / rel).resolve()
+    dest_resolved = dest.resolve()
+    try:
+        candidate.relative_to(dest_resolved)
+    except ValueError:
+        return None
+    return candidate
+
+
+def _human_size(num_bytes: Optional[int]) -> str:
+    """Format a byte count as a short human-readable string."""
+    if num_bytes is None:
+        return "-"
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
 
 
 def _print_status(result: dict) -> None:

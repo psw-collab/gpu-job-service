@@ -123,3 +123,71 @@ def test_logs_follow_end_to_end_terminal(route_cli_to_mock, monkeypatch):
     result = runner.invoke(app, ["logs", "-f", "job-fin"])
     assert result.exit_code == 0, result.output
     assert "all done" in result.stdout
+
+
+# --- outputs, end to end against the mock ---
+
+from tests import mock_server  # noqa: E402
+
+
+class _WrapResp:
+    """Adapts a TestClient response to the httpx.stream context-manager API."""
+
+    def __init__(self, resp):
+        self._resp = resp
+        self.status_code = resp.status_code
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def iter_bytes(self):
+        yield self._resp.content
+
+    def read(self):
+        return self._resp.content
+
+
+@pytest.fixture
+def route_cli_to_mock_stream(route_cli_to_mock, monkeypatch):
+    """Extends the base routing fixture to also send httpx.stream (used by
+    download_output) into the in-process mock server."""
+    client = route_cli_to_mock
+
+    def fake_stream(method, url, timeout=None, follow_redirects=False, **kwargs):
+        path = url.split("testserver", 1)[1] if "testserver" in url else url
+        return _WrapResp(client.get(path))
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+    return client
+
+
+def test_outputs_list_end_to_end(route_cli_to_mock):
+    mock_server.seed_outputs("job-e2e", [("out.txt", b"hello"), ("models/best.pt", b"xx")])
+    result = runner.invoke(app, ["outputs", "job-e2e"])
+    assert result.exit_code == 0, result.output
+    assert "out.txt" in result.stdout
+    assert "models/best.pt" in result.stdout
+
+
+def test_outputs_download_end_to_end(route_cli_to_mock_stream, tmp_path):
+    mock_server.seed_outputs("job-dl", [("models/best.pt", b"weights"), ("log.txt", b"done")])
+    result = runner.invoke(app, ["outputs", "job-dl", "--download", "--dest", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "models" / "best.pt").read_bytes() == b"weights"
+    assert (tmp_path / "log.txt").read_bytes() == b"done"
+
+
+def test_outputs_unknown_job_end_to_end(route_cli_to_mock):
+    result = runner.invoke(app, ["outputs", "job-does-not-exist"])
+    assert result.exit_code == 1
+    assert "No job found" in result.output
+
+
+def test_outputs_running_job_is_409_end_to_end(route_cli_to_mock):
+    mock_server._jobs["job-still-running"] = {"status": "RUNNING"}
+    result = runner.invoke(app, ["outputs", "job-still-running"])
+    assert result.exit_code == 1
+    assert "still running" in result.output.lower()

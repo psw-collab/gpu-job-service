@@ -184,3 +184,91 @@ def test_logs_follow_status_error_exits_1(monkeypatch):
     result = runner.invoke(app, ["logs", "-f", "job-nope"])
     assert result.exit_code == 1
     assert "No job found" in result.output
+
+
+# --- outputs command ---
+
+
+def _outputs_stub(files):
+    def _stub(base_url, job_id, api_key=None, identity_token=None):
+        return {"job_id": job_id, "outputs": files}
+    return _stub
+
+
+def test_outputs_list(monkeypatch):
+    monkeypatch.setattr(api_client, "get_job_outputs", _outputs_stub(
+        [{"path": "models/best.pt", "size_bytes": 2048, "url": "http://o/1", "expires_at": "z"}]
+    ))
+    result = runner.invoke(app, ["outputs", "job-abc"])
+    assert result.exit_code == 0, result.output
+    assert "models/best.pt" in result.stdout
+    assert "2.0 KB" in result.stdout
+
+
+def test_outputs_empty(monkeypatch):
+    monkeypatch.setattr(api_client, "get_job_outputs", _outputs_stub([]))
+    result = runner.invoke(app, ["outputs", "job-abc"])
+    assert result.exit_code == 0
+    assert "no output files" in result.stdout.lower()
+
+
+def test_outputs_not_found_exits_1(monkeypatch):
+    def boom(base_url, job_id, api_key=None, identity_token=None):
+        raise api_client.ApiError("No job found with ID 'job-nope'.", status_code=404)
+
+    monkeypatch.setattr(api_client, "get_job_outputs", boom)
+    result = runner.invoke(app, ["outputs", "job-nope"])
+    assert result.exit_code == 1
+    assert "No job found" in result.output
+
+
+def test_outputs_download(monkeypatch, tmp_path):
+    monkeypatch.setattr(api_client, "get_job_outputs", _outputs_stub(
+        [{"path": "models/best.pt", "size_bytes": 3, "url": "http://o/1", "expires_at": "z"}]
+    ))
+
+    def fake_dl(url, dest):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"abc")
+
+    monkeypatch.setattr(api_client, "download_output", fake_dl)
+    result = runner.invoke(app, ["outputs", "job-abc", "--download", "--dest", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "models" / "best.pt").read_bytes() == b"abc"
+    assert "Downloaded" in result.stdout
+
+
+def test_outputs_download_rejects_path_traversal(monkeypatch, tmp_path):
+    monkeypatch.setattr(api_client, "get_job_outputs", _outputs_stub(
+        [{"path": "../evil.txt", "size_bytes": 3, "url": "http://o/1", "expires_at": "z"}]
+    ))
+    called = []
+    monkeypatch.setattr(api_client, "download_output", lambda url, dest: called.append(dest))
+    result = runner.invoke(app, ["outputs", "job-abc", "--download", "--dest", str(tmp_path)])
+    assert result.exit_code == 0
+    assert called == []  # traversal entry skipped, never downloaded
+    assert "suspicious path" in result.output.lower()
+
+
+def test_outputs_still_running_409(monkeypatch):
+    def boom(base_url, job_id, api_key=None, identity_token=None):
+        raise api_client.ApiError("Outputs are not available until the job completes.",
+                                  status_code=409)
+
+    monkeypatch.setattr(api_client, "get_job_outputs", boom)
+    result = runner.invoke(app, ["outputs", "job-running"])
+    assert result.exit_code == 1
+    assert "still running" in result.output.lower()
+
+
+def test_outputs_download_default_dest_is_job_id(monkeypatch, tmp_path):
+    monkeypatch.setattr(api_client, "get_job_outputs", _outputs_stub(
+        [{"path": "models/best.pt", "size_bytes": 3, "url": "http://o/1", "expires_at": "z"}]
+    ))
+    seen = []
+    monkeypatch.setattr(api_client, "download_output", lambda url, dest: seen.append(dest))
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["outputs", "job-abc", "--download"])
+    assert result.exit_code == 0, result.output
+    # No --dest given: files should land under ./job-abc/
+    assert seen and (tmp_path / "job-abc").resolve() in seen[0].parents
