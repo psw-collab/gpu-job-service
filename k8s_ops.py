@@ -41,6 +41,15 @@ MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "")
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "job-outputs")
 
+# --- Continuous log shipping (Fluent Bit native sidecar -> MinIO/S3) ---
+FLUENTBIT_IMAGE = os.getenv("FLUENTBIT_IMAGE", "cr.fluentbit.io/fluent/fluent-bit:3.1.9")
+LOG_DIR = "/var/log/job"
+LOG_FILE = f"{LOG_DIR}/stdout.log"
+LOG_EXIT_FILE = f"{LOG_DIR}/.exit"
+LOG_BUCKET = os.getenv("LOG_BUCKET", MINIO_BUCKET)
+_S3_TLS = "On" if MINIO_ENDPOINT.startswith("https://") else "Off"
+_S3_ENDPOINT_HOSTPORT = MINIO_ENDPOINT.split("://", 1)[-1]
+
 FAILURE_REASON_OOM = "Your job ran out of memory. Try requesting more memory or reducing batch size."
 FAILURE_REASON_NODE = "A hardware issue interrupted your job. This is not a problem with your code, please resubmit."
 FAILURE_REASON_USER_CODE = "Your job exited with an error. Check the logs for the full traceback."
@@ -121,6 +130,59 @@ def _owner_reference_for(created_job) -> "client.V1OwnerReference":
     )
 
 
+def _fluentbit_config(job_id: str) -> str:
+    return f"""[SERVICE]
+    Flush        2
+    Daemon       Off
+    Log_Level    info
+    Grace        25
+
+[INPUT]
+    Name             tail
+    Path             {LOG_FILE}
+    Tag              job.{job_id}
+    Refresh_Interval 1
+    Read_from_Head   true
+
+[OUTPUT]
+    Name             s3
+    Match            *
+    bucket           {LOG_BUCKET}
+    region           us-east-1
+    endpoint         ${{S3_ENDPOINT}}
+    tls              ${{S3_TLS}}
+    use_put_object   On
+    static_file_path On
+    total_file_size  1M
+    upload_timeout   10s
+    s3_key_format    /logs/{job_id}/stdout-%Y%m%d-%H%M%S-$UUID.log
+"""
+
+
+def _log_sidecar() -> "client.V1Container":
+    # Native sidecar = init container with restartPolicy: Always (K8s 1.28+/GKE 1.35).
+    # K8s terminates it when the main container exits, so the Job still completes.
+    return client.V1Container(
+        name="log-shipper",
+        image=FLUENTBIT_IMAGE,
+        restart_policy="Always",
+        args=["-c", "/fluent-bit/etc/custom/fluent-bit.conf"],
+        env=[
+            client.V1EnvVar(name="S3_ENDPOINT", value=_S3_ENDPOINT_HOSTPORT),
+            client.V1EnvVar(name="S3_TLS", value=_S3_TLS),
+            client.V1EnvVar(name="AWS_ACCESS_KEY_ID", value=MINIO_ACCESS_KEY),
+            client.V1EnvVar(name="AWS_SECRET_ACCESS_KEY", value=MINIO_SECRET_KEY),
+        ],
+        volume_mounts=[
+            client.V1VolumeMount(name="joblogs", mount_path=LOG_DIR),
+            client.V1VolumeMount(name="fbconfig", mount_path="/fluent-bit/etc/custom"),
+        ],
+        resources=client.V1ResourceRequirements(
+            requests={"cpu": "50m", "memory": "64Mi"},
+            limits={"cpu": "200m", "memory": "128Mi"},
+        ),
+    )
+
 def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requirements: str, python_version: str,
                     gpu_type: str, gpu_count: int):
     """Legacy single-file path: run straight off python:{python_version}-slim,
@@ -134,12 +196,21 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
     # container must still exit with the entrypoint's own exit code so job
     # success/failure classification (k8s_status / classify_pod_failure)
     # keeps reflecting the user's script, not the uploader.
+    # command = (
+    #     "mkdir -p /outputs\n"
+    #     "pip install -r /scripts/requirements.txt 2>/dev/null\n"
+    #     "pip install boto3 2>/dev/null\n"
+    #     f"python /scripts/{entrypoint}\n"
+    #     "ENTRYPOINT_EXIT=$?\n"
+    #     'python /scripts/upload_outputs.py || echo "output upload failed"\n'
+    #     "exit $ENTRYPOINT_EXIT"
+    # )
     command = (
-        "mkdir -p /outputs\n"
+        "mkdir -p /outputs " + LOG_DIR + "\n"
         "pip install -r /scripts/requirements.txt 2>/dev/null\n"
         "pip install boto3 2>/dev/null\n"
-        f"python /scripts/{entrypoint}\n"
-        "ENTRYPOINT_EXIT=$?\n"
+        "{ python /scripts/" + entrypoint + "; echo $? > " + LOG_EXIT_FILE + "; } 2>&1 | tee -a " + LOG_FILE + "\n"
+        "ENTRYPOINT_EXIT=$(cat " + LOG_EXIT_FILE + ")\n"
         'python /scripts/upload_outputs.py || echo "output upload failed"\n'
         "exit $ENTRYPOINT_EXIT"
     )
@@ -150,6 +221,7 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
         volume_mounts=[
             client.V1VolumeMount(name="code", mount_path="/scripts"),
             client.V1VolumeMount(name="outputs", mount_path="/outputs"),
+            client.V1VolumeMount(name="joblogs", mount_path=LOG_DIR),
         ],
         env=[
             client.V1EnvVar(name="MINIO_ENDPOINT", value=MINIO_ENDPOINT),
@@ -167,6 +239,8 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
     pod_spec = client.V1PodSpec(
         restart_policy="Never",
         containers=[container],
+        init_containers=[_log_sidecar()],
+        termination_grace_period_seconds=30,
         node_selector=_gpu_node_selector(gpu_type),
         volumes=[
             client.V1Volume(
@@ -175,6 +249,12 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
             client.V1Volume(
                 name="outputs",
                 empty_dir=client.V1EmptyDirVolumeSource()),
+            client.V1Volume(
+                name="joblogs",
+                empty_dir=client.V1EmptyDirVolumeSource()),
+            client.V1Volume(
+                name="fbconfig",
+                config_map=client.V1ConfigMapVolumeSource(name=f"{job_id}-fbconfig")),
         ],
     )
     created_job = batch.create_namespaced_job(
@@ -198,6 +278,14 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
             },
         ),
     )
+    core.create_namespaced_config_map(
+        NAMESPACE,
+        client.V1ConfigMap(
+            metadata=client.V1ObjectMeta(name=f"{job_id}-fbconfig",
+                                         owner_references=[_owner_reference_for(created_job)]),
+            data={"fluent-bit.conf": _fluentbit_config(job_id)},
+        ),
+    )
 
 
 def create_training_job_from_image(job_id: str, image_tag: str, entrypoint: str, gpu_type: str, gpu_count: int):
@@ -205,10 +293,16 @@ def create_training_job_from_image(job_id: str, image_tag: str, entrypoint: str,
     (built by Kaniko in create_build_job), so no ConfigMap/pip install here --
     just run the entrypoint directly. The image is private on GHCR, so this
     reuses the same read-only pull secret the worker's own Deployment uses."""
+    run_cmd = (
+        "mkdir -p " + LOG_DIR + "\n"
+        "{ python /workspace/" + entrypoint + "; echo $? > " + LOG_EXIT_FILE + "; } 2>&1 | tee -a " + LOG_FILE + "\n"
+        "exit $(cat " + LOG_EXIT_FILE + ")"
+    )
     container = client.V1Container(
         name="runner",
         image=image_tag,
-        command=["python", f"/workspace/{entrypoint}"],
+        command=["sh", "-c", run_cmd],
+        volume_mounts=[client.V1VolumeMount(name="joblogs", mount_path=LOG_DIR)],
         resources=client.V1ResourceRequirements(
             limits={"nvidia.com/gpu": str(gpu_count)},
         ),
@@ -216,10 +310,17 @@ def create_training_job_from_image(job_id: str, image_tag: str, entrypoint: str,
     pod_spec = client.V1PodSpec(
         restart_policy="Never",
         containers=[container],
+        init_containers=[_log_sidecar()],
+        termination_grace_period_seconds=30,
         node_selector=_gpu_node_selector(gpu_type),
         image_pull_secrets=[client.V1LocalObjectReference(name=GHCR_PULL_SECRET_NAME)],
+        volumes=[
+            client.V1Volume(name="joblogs", empty_dir=client.V1EmptyDirVolumeSource()),
+            client.V1Volume(name="fbconfig",
+                            config_map=client.V1ConfigMapVolumeSource(name=f"{job_id}-fbconfig")),
+        ],
     )
-    batch.create_namespaced_job(
+    created_job = batch.create_namespaced_job(
         NAMESPACE,
         client.V1Job(
             metadata=client.V1ObjectMeta(name=job_id),
@@ -227,6 +328,14 @@ def create_training_job_from_image(job_id: str, image_tag: str, entrypoint: str,
                 template=client.V1PodTemplateSpec(spec=pod_spec),
                 backoff_limit=0,
                 ttl_seconds_after_finished=300),
+        ),
+    )
+    core.create_namespaced_config_map(
+        NAMESPACE,
+        client.V1ConfigMap(
+            metadata=client.V1ObjectMeta(name=f"{job_id}-fbconfig",
+                                         owner_references=[_owner_reference_for(created_job)]),
+            data={"fluent-bit.conf": _fluentbit_config(job_id)},
         ),
     )
 

@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements-worker.txt .
 RUN pip install --no-cache-dir -r requirements-worker.txt
 
-COPY k8s_ops.py worker.py ./
+COPY k8s_ops.py worker.py upload_outputs.py ./
 
 ENV PORT=8080
 CMD ["sh", "-c", "uvicorn worker:app --host 0.0.0.0 --port ${PORT}"]
