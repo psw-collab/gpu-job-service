@@ -54,6 +54,34 @@ Full rationale and architecture are in
    uvicorn main:app --reload
    ```
 
+5. **(Optional) Configure output uploads to MinIO/S3**
+
+   After a job's entrypoint finishes, `upload_outputs.py` runs inside the pod and pushes
+   anything written to `/outputs` up to S3-compatible object storage. This step is
+   optional — if unset, it fails harmlessly (the job's own exit status is unaffected,
+   see `k8s_ops.py`'s `create_k8s_job`) and logs `output upload failed`.
+
+   To enable it against the local MinIO from `docker-compose.yml` (`job-outputs` bucket,
+   already created by the `createbucket` service), set these in the **worker's own
+   environment** before starting it — `k8s_ops.py` reads them and forwards them into
+   each job's pod:
+
+   ```bash
+   export MINIO_ENDPOINT=http://localhost:9000
+   export MINIO_ACCESS_KEY=minioadmin
+   export MINIO_SECRET_KEY=minioadmin
+   export MINIO_BUCKET=job-outputs
+   ```
+
+   A `.env.example` at the repo root has these documented too. There's no `.env` auto-loading
+   in this codebase (no `python-dotenv`), so either `export` them directly or
+   `set -a; source .env; set +a` before running `uvicorn`.
+
+   **Note:** these values only work if the pod can actually reach that endpoint. If your
+   Kubernetes Job runs on a real remote cluster (not a local kind/minikube), `localhost`
+   inside the pod refers to the pod itself, not your laptop — you'd need to expose MinIO
+   via a tunnel (e.g. `ngrok`) or run it inside the cluster instead.
+
 
 ## Submitting a job
 
