@@ -1,20 +1,19 @@
 """
 upload_outputs.py
 
-Uploads a job's output files to MinIO/S3-compatible object storage. Meant to
-run as the final step inside a job's pod, after the user's script finishes.
+Uploads a job's output files to Google Cloud Storage. Meant to run as the
+final step inside a job's pod, after the user's script finishes. Authenticates
+via Application Default Credentials -- on GKE this resolves through Workload
+Identity to the pod's service account, so no static keys are needed.
 
 Walks OUTPUTS_DIR recursively and uploads each file found under the object
 key "<JOB_ID>/<relative path from OUTPUTS_DIR>", preserving subdirectory
 structure.
 
 Environment variables:
-    MINIO_ENDPOINT     S3-compatible endpoint URL, e.g. http://localhost:9000
-    MINIO_ACCESS_KEY   Access key for the endpoint
-    MINIO_SECRET_KEY   Secret key for the endpoint
-    MINIO_BUCKET       Bucket to upload into, e.g. job-outputs
-    JOB_ID             Used as the object key prefix for this job's files
-    OUTPUTS_DIR        Optional. Directory to walk. Defaults to /outputs.
+    GCS_BUCKET      Bucket to upload into. Defaults to gpujob-outputs-shared.
+    JOB_ID          Used as the object key prefix for this job's files
+    OUTPUTS_DIR     Optional. Directory to walk. Defaults to /outputs.
 
 Exit codes:
     0   Success, including the case where there is nothing to upload
@@ -26,18 +25,15 @@ import os
 import sys
 from pathlib import Path
 
-import boto3
-from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError
+from google.api_core.exceptions import GoogleAPIError
+from google.cloud import storage
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("upload_outputs")
 
+DEFAULT_GCS_BUCKET = "gpujob-outputs-shared"
+
 REQUIRED_ENV_VARS = (
-    "MINIO_ENDPOINT",
-    "MINIO_ACCESS_KEY",
-    "MINIO_SECRET_KEY",
-    "MINIO_BUCKET",
     "JOB_ID",
 )
 
@@ -49,10 +45,7 @@ def load_config() -> dict:
         sys.exit(1)
 
     return {
-        "endpoint": os.environ["MINIO_ENDPOINT"],
-        "access_key": os.environ["MINIO_ACCESS_KEY"],
-        "secret_key": os.environ["MINIO_SECRET_KEY"],
-        "bucket": os.environ["MINIO_BUCKET"],
+        "bucket": os.environ.get("GCS_BUCKET", DEFAULT_GCS_BUCKET),
         "job_id": os.environ["JOB_ID"],
         "outputs_dir": Path(os.environ.get("OUTPUTS_DIR", "/outputs")),
     }
@@ -68,18 +61,18 @@ def build_object_key(job_id: str, outputs_dir: Path, file_path: Path) -> str:
     return f"{job_id}/{relative.as_posix()}"
 
 
-def upload_files(s3_client, bucket: str, job_id: str, outputs_dir: Path, files: list) -> tuple:
+def upload_files(bucket, job_id: str, outputs_dir: Path, files: list) -> tuple:
     uploaded = 0
     failed = 0
     for file_path in files:
         key = build_object_key(job_id, outputs_dir, file_path)
         try:
-            s3_client.upload_file(str(file_path), bucket, key)
-        except (BotoCoreError, ClientError) as e:
-            logger.error("FAILED  %s -> s3://%s/%s: %s", file_path, bucket, key, e)
+            bucket.blob(key).upload_from_filename(str(file_path))
+        except GoogleAPIError as e:
+            logger.error("FAILED  %s -> gs://%s/%s: %s", file_path, bucket.name, key, e)
             failed += 1
             continue
-        logger.info("uploaded %s -> s3://%s/%s", file_path, bucket, key)
+        logger.info("uploaded %s -> gs://%s/%s", file_path, bucket.name, key)
         uploaded += 1
     return uploaded, failed
 
@@ -97,22 +90,14 @@ def main():
         logger.info("OUTPUTS_DIR %s is empty, nothing to upload.", outputs_dir)
         sys.exit(0)
 
-    s3_client = boto3.client(
-        "s3",
-        endpoint_url=config["endpoint"],
-        aws_access_key_id=config["access_key"],
-        aws_secret_access_key=config["secret_key"],
-        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
-    )
+    bucket = storage.Client().bucket(config["bucket"])
 
     logger.info(
-        "Uploading %d file(s) from %s to s3://%s/%s/...",
+        "Uploading %d file(s) from %s to gs://%s/%s/...",
         len(files), outputs_dir, config["bucket"], config["job_id"],
     )
 
-    uploaded, failed = upload_files(
-        s3_client, config["bucket"], config["job_id"], outputs_dir, files
-    )
+    uploaded, failed = upload_files(bucket, config["job_id"], outputs_dir, files)
 
     logger.info("Done: %d uploaded, %d failed (of %d total).", uploaded, failed, len(files))
 
