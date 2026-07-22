@@ -54,34 +54,43 @@ Full rationale and architecture are in
    uvicorn main:app --reload
    ```
 
-5. **(Optional) Configure output uploads to MinIO/S3**
+5. **Output uploads (GCS via Workload Identity)**
 
    After a job's entrypoint finishes, `upload_outputs.py` runs inside the pod and pushes
-   anything written to `/outputs` up to S3-compatible object storage. This step is
-   optional — if unset, it fails harmlessly (the job's own exit status is unaffected,
-   see `k8s_ops.py`'s `create_k8s_job`) and logs `output upload failed`.
+   anything written to `/outputs` to a Google Cloud Storage bucket. Authentication uses
+   **Workload Identity** — the pod runs under a Kubernetes service account (`gpu-job-sa`)
+   bound to a GCP service account (`gpu-worker-sa`) that has write access to the bucket.
+   No static keys or credentials are needed (the project's org policy blocks
+   service-account key creation).
 
-   To enable it against the local MinIO from `docker-compose.yml` (`job-outputs` bucket,
-   already created by the `createbucket` service), set these in the **worker's own
-   environment** before starting it — `k8s_ops.py` reads them and forwards them into
-   each job's pod:
+   Configure the bucket via the worker's environment (forwarded into each job's pod):
 
-   ```bash
-   export MINIO_ENDPOINT=http://localhost:9000
-   export MINIO_ACCESS_KEY=minioadmin
-   export MINIO_SECRET_KEY=minioadmin
-   export MINIO_BUCKET=job-outputs
-   ```
+```bash
+   export GCS_BUCKET=gpujob-outputs-shared
+```
 
-   A `.env.example` at the repo root has these documented too. There's no `.env` auto-loading
-   in this codebase (no `python-dotenv`), so either `export` them directly or
-   `set -a; source .env; set +a` before running `uvicorn`.
+   **One-time Workload Identity setup** (per cluster):
 
-   **Note:** these values only work if the pod can actually reach that endpoint. If your
-   Kubernetes Job runs on a real remote cluster (not a local kind/minikube), `localhost`
-   inside the pod refers to the pod itself, not your laptop — you'd need to expose MinIO
-   via a tunnel (e.g. `ngrok`) or run it inside the cluster instead.
+```bash
+   # 1. Grant the GCP service account write access to the bucket
+   gcloud storage buckets add-iam-policy-binding gs://gpujob-outputs-shared \
+     --member="serviceAccount:gpu-worker-sa@intern-501105.iam.gserviceaccount.com" \
+     --role="roles/storage.objectAdmin"
 
+   # 2. Create + annotate the Kubernetes service account
+   kubectl create serviceaccount gpu-job-sa -n gpu-jobs
+   kubectl annotate serviceaccount gpu-job-sa -n gpu-jobs \
+     iam.gke.io/gcp-service-account=gpu-worker-sa@intern-501105.iam.gserviceaccount.com
+
+   # 3. Bind the K8s SA to the GCP SA (needs Service Account Admin; may require a project admin)
+   gcloud iam service-accounts add-iam-policy-binding \
+     gpu-worker-sa@intern-501105.iam.gserviceaccount.com \
+     --role roles/iam.workloadIdentityUser \
+     --member "serviceAccount:intern-501105.svc.id.goog[gpu-jobs/gpu-job-sa]"
+```
+
+   The cluster must have Workload Identity enabled
+   (`--workload-pool=intern-501105.svc.id.goog` at creation).
 
 ## Submitting a job
 
