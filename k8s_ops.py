@@ -39,6 +39,16 @@ _HEADERS = {"X-Internal-Token": INTERNAL_TOKEN}
 GCS_BUCKET = os.getenv("GCS_BUCKET", "gpujob-outputs-shared")
 POD_SERVICE_ACCOUNT = os.getenv("POD_SERVICE_ACCOUNT", "gpu-job-sa")
 
+# --- Continuous log shipping (sidecar -> GCS, keyless via Workload Identity) ---
+# The runner tees its output to LOG_FILE on a shared volume; a sidecar running
+# ship_logs.py uploads that file to gs://<bucket>/logs/<job_id>/ as the job
+# runs, so logs survive an ungraceful pod death. Same auth (ADC/Workload
+# Identity) and bucket as upload_outputs.py -- no static keys.
+LOG_DIR = "/var/log/job"
+LOG_FILE = f"{LOG_DIR}/stdout.log"
+LOG_EXIT_FILE = f"{LOG_DIR}/.exit"
+LOG_SHIP_INTERVAL = os.getenv("LOG_SHIP_INTERVAL", "5")
+
 GPU_ENABLED = os.getenv("GPU_ENABLED", "false").lower() == "true"
 GPU_ACCELERATOR_TYPE = os.getenv("GPU_ACCELERATOR_TYPE", "nvidia-l4")
 
@@ -73,11 +83,42 @@ def trigger_gc() -> int:
     return resp.json().get("deleted", 0)
 
 
+def _log_sidecar(job_id: str, python_version: str) -> "client.V1Container":
+    """Native sidecar (init container with restartPolicy: Always, K8s 1.28+/GKE
+    1.35) that ships the shared log file to GCS while the job runs. Runs
+    ship_logs.py off the same /scripts ConfigMap and inherits the pod's
+    service account, so auth is keyless via Workload Identity -- same as the
+    output uploader. As a native sidecar it's terminated when the runner
+    exits, so the Job still completes."""
+    return client.V1Container(
+        name="log-shipper",
+        image=f"python:{python_version}-slim",
+        restart_policy="Always",
+        command=["sh", "-c", "pip install google-cloud-storage 2>/dev/null; python /scripts/ship_logs.py"],
+        env=[
+            client.V1EnvVar(name="GCS_BUCKET", value=GCS_BUCKET),
+            client.V1EnvVar(name="JOB_ID", value=job_id),
+            client.V1EnvVar(name="LOG_FILE", value=LOG_FILE),
+            client.V1EnvVar(name="LOG_SHIP_INTERVAL", value=LOG_SHIP_INTERVAL),
+        ],
+        volume_mounts=[
+            client.V1VolumeMount(name="code", mount_path="/scripts"),
+            client.V1VolumeMount(name="joblogs", mount_path=LOG_DIR),
+        ],
+        resources=client.V1ResourceRequirements(
+            requests={"cpu": "50m", "memory": "64Mi"},
+            limits={"cpu": "200m", "memory": "128Mi"},
+        ),
+    )
+
+
 def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requirements: str, python_version: str,
                     gpu_count: int):
-    uploader_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upload_outputs.py")
-    with open(uploader_path) as f:
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, "upload_outputs.py")) as f:
         uploader_content = f.read()
+    with open(os.path.join(here, "ship_logs.py")) as f:
+        ship_logs_content = f.read()
 
     core.create_namespaced_config_map(
         NAMESPACE,
@@ -87,6 +128,7 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
                 entrypoint: entrypoint_content,
                 "requirements.txt": requirements or "",
                 "upload_outputs.py": uploader_content,
+                "ship_logs.py": ship_logs_content,
             },
         ),
     )
@@ -95,11 +137,14 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
     # success/failure classification (k8s_status / classify_pod_failure)
     # keeps reflecting the user's script, not the uploader.
     command = (
-        "mkdir -p /outputs\n"
+        "mkdir -p /outputs " + LOG_DIR + "\n"
         "pip install -r /scripts/requirements.txt 2>/dev/null\n"
         "pip install google-cloud-storage 2>/dev/null\n"
-        f"python /scripts/{entrypoint}\n"
-        "ENTRYPOINT_EXIT=$?\n"
+        # Tee the entrypoint's output to the shared log file for the sidecar to
+        # ship, while keeping stdout intact (so end-of-job capture still works)
+        # and preserving the script's real exit code (dash has no PIPESTATUS).
+        "{ python /scripts/" + entrypoint + "; echo $? > " + LOG_EXIT_FILE + "; } 2>&1 | tee -a " + LOG_FILE + "\n"
+        "ENTRYPOINT_EXIT=$(cat " + LOG_EXIT_FILE + ")\n"
         'python /scripts/upload_outputs.py || echo "output upload failed"\n'
         "exit $ENTRYPOINT_EXIT"
     )
@@ -120,6 +165,7 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
         volume_mounts=[
             client.V1VolumeMount(name="code", mount_path="/scripts"),
             client.V1VolumeMount(name="outputs", mount_path="/outputs"),
+            client.V1VolumeMount(name="joblogs", mount_path=LOG_DIR),
         ],
         env=[
             client.V1EnvVar(name="GCS_BUCKET", value=GCS_BUCKET),
@@ -132,12 +178,17 @@ def create_k8s_job(job_id: str, entrypoint: str, entrypoint_content: str, requir
         restart_policy="Never",
         service_account_name=POD_SERVICE_ACCOUNT,
         containers=[container],
+        init_containers=[_log_sidecar(job_id, python_version)],
+        termination_grace_period_seconds=30,
         volumes=[
             client.V1Volume(
                 name="code",
                 config_map=client.V1ConfigMapVolumeSource(name=f"{job_id}-files")),
             client.V1Volume(
                 name="outputs",
+                empty_dir=client.V1EmptyDirVolumeSource()),
+            client.V1Volume(
+                name="joblogs",
                 empty_dir=client.V1EmptyDirVolumeSource()),
         ],
         node_selector=node_selector,
